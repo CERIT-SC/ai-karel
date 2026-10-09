@@ -1,0 +1,2 @@
+["get", "pods", "-n", "cattle-monitoring-system", "-l", "prometheus=rancher-monitoring-prometheus", "-o", "json"]
+["logs", "prom-0", "-n", "cattle-monitoring-system", "-c", "thanos-sidecar", "--timestamps", "--limit-bytes=400"]

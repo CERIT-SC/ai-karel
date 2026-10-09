@@ -1,0 +1,188 @@
+---
+# Karel event buffer.
+#
+# Kubernetes Events expire after the apiserver --event-ttl (1h by default), so a
+# daily report sees the last hour of a 24-hour window and will confidently
+# describe a quiet night. OOMKills, evictions, FailedScheduling, probe failures
+# and image pull errors are all Events.
+#
+# This runs every 15 minutes and accumulates deduplicated, aggregated event
+# counts into a per-day ConfigMap. The daily run reads them via
+# bin/fetch_event_buffer.py.
+#
+# Deliberately a SEPARATE ServiceAccount from Karel: this component writes, and
+# it should not inherit Karel's cluster-wide read.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: karel-event-buffer
+  namespace: ai-karel-ns
+  labels:
+    app: karel
+    karel/component: event-buffer
+
+---
+# Cluster-wide events only. Nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: karel-event-buffer
+  labels:
+    app: karel
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["list"]
+  # The filtered collection splits platform vs tenant namespaces server-side;
+  # discovering platform namespaces needs the namespace list.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: karel-event-buffer
+  labels:
+    app: karel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: karel-event-buffer
+subjects:
+  - kind: ServiceAccount
+    name: karel-event-buffer
+    namespace: ai-karel-ns
+
+---
+# ConfigMap writes are confined to Karel's own namespace.
+# `create` cannot be resourceNames-scoped: the object does not exist at
+# admission time. The mutating verbs are scoped by name prefix where the API
+# allows it, which is only via explicit names - so they are namespace-scoped
+# and the namespace is the boundary.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: karel-event-buffer
+  namespace: ai-karel-ns
+  labels:
+    app: karel
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: karel-event-buffer
+  namespace: ai-karel-ns
+  labels:
+    app: karel
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: karel-event-buffer
+subjects:
+  - kind: ServiceAccount
+    name: karel-event-buffer
+    namespace: ai-karel-ns
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: karel-event-buffer
+  namespace: ai-karel-ns
+  labels:
+    app: karel
+    karel/component: event-buffer
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: "Etc/UTC"
+
+  # Never let two runs overlap - they would both read-modify-write the same
+  # ConfigMap and the later apply would silently discard the other's events.
+  concurrencyPolicy: Forbid
+
+  # If the controller was down, do not fire a backlog of missed runs.
+  startingDeadlineSeconds: 300
+
+  # 96 runs/day. Keep almost no history: every retained Job is a Job object
+  # plus a Pod object in etcd, and Karel has a rule that complains about etcd
+  # growth. Do not let the event buffer become the thing it reports on.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      # One attempt. A missed 15-minute window costs almost nothing; a retry
+      # storm against the apiserver during an incident costs a lot.
+      backoffLimit: 0
+      activeDeadlineSeconds: 180
+      ttlSecondsAfterFinished: 900
+
+      template:
+        metadata:
+          labels:
+            app: karel
+            karel/component: event-buffer
+        spec:
+          serviceAccountName: karel-event-buffer
+          restartPolicy: Never
+          automountServiceAccountToken: true
+
+          # This pod is scheduled 96 times a day; it must never be the reason
+          # something else cannot schedule.
+          priorityClassName: system-cluster-critical
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            fsGroup: 1000
+            seccompProfile:
+              type: RuntimeDefault
+
+          containers:
+            - name: event-buffer
+              image: cerit.io/ai/karel:v0.1
+              imagePullPolicy: IfNotPresent
+
+              command: ["python3", "/opt/karel/bin/event_buffer.py"]
+
+              env:
+                - name: KAREL_NS
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: HOME
+                  value: /tmp
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  memory: 512Mi
+
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi

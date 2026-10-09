@@ -1,0 +1,136 @@
+{
+  "_comment": "One entry per log check, run by bin/collect_logs.py --check <name> (wired as k_log_<name> in k8s-commands.json). Rules are evaluated in order; the first match wins. kind: ignore (dropped, counted), success (heartbeat, windowed), state (whole-log presence), error (windowed). After the explicit rules a catch-all 'unclassified' takes any remaining line with level=error or an err field. Selection is by namespace + label selector + container; selectors and message texts marked CONFIRM below are best guesses that need one real sample. Patterns live here so ops can tune them without a code change.",
+
+  "checks": {
+    "fleet_agent": {
+      "namespace": "cattle-fleet-system",
+      "selector": "app=fleet-agent",
+      "container": "fleet-agent",
+      "expect_pods": true,
+      "rules": [
+        {"class": "conflict_retry", "kind": "ignore", "field": "line",
+         "regex": "the object has been modified; please apply your changes to the latest version"},
+
+        {"class": "ssa_conflict", "kind": "error", "field": "line",
+         "regex": "Apply failed with \\d+ conflicts?:",
+         "extract_many": [
+           {"field": "error",
+            "regex": "conflict with \"(?P<manager>[^\"]+)\" using (?P<gvk>\\S+): (?P<path>.+?)(?=\\s*&&\\s*|, conflict with|$)",
+            "groups": ["manager", "gvk", "path"]},
+           {"field": "msg",
+            "regex": "conflict with \"(?P<manager>[^\"]+)\" using (?P<gvk>\\S+): (?P<path>.+?)(?=\\s*&&\\s*|, conflict with|$)",
+            "groups": ["manager", "gvk", "path"]}],
+         "extract": {"object": {"field": "error",
+                                "regex": "applying object (?P<object>[\\w.\\-]+/[\\w.\\-]+)"}},
+         "_note": "CONFIRMED on fleet-agent (zap JSON): msg='Reconciler error', the conflict chain with the apiserver text lives in `error`; objects are named in 'applying object <ns>/<name>'"}
+      ]
+    },
+
+    "thanos_sidecar": {
+      "namespace": "cattle-monitoring-system",
+      "selector": "prometheus=rancher-monitoring-prometheus",
+      "container": "thanos-sidecar",
+      "also_args_from": "prometheus",
+      "expect_pods": true,
+      "rules": [
+        {"class": "upload_ok", "kind": "success", "field": "msg",
+         "regex": "^upload new block$",
+         "extract": {"id": "field:id"}},
+
+        {"class": "stat_block_race", "kind": "ignore", "field": "err",
+         "regex": "stat block .*: no such file or directory",
+         "require_followed_by": {"class": "upload_ok", "within_s": 300,
+                                 "else_class": "block_missing"}},
+
+        {"class": "uploads_disabled", "kind": "state", "field": "msg",
+         "regex": "(?i)(upload (mode )?is disabled|external labels.*(not set|missing))",
+         "_note": "CONFIRM: exact message from a thanos build with upload unset"},
+
+        {"class": "startup_wait", "kind": "ignore", "field": "line",
+         "regex": "failed to get Prometheus flags|no external labels found|(127\\.0\\.0\\.1|localhost|\\[::1\\]):9090.*(connection refused|i/o timeout|deadline exceeded)",
+         "_note": "CONFIRMED on this build: while Prometheus restarts the sidecar logs 'failed to get Prometheus flags... 503' and aborts with 'no external labels found'"},
+
+        {"classifier": "s3", "field": "err"}
+      ]
+    },
+
+    "thanos_compactor": {
+      "namespace": "cattle-monitoring-system",
+      "selector": "app=thanos-compactor",
+      "container": "thanos-compactor",
+      "expect_pods": true,
+      "rules": [
+        {"class": "halted", "kind": "state", "field": "msg",
+         "regex": "critical error detected; halting"},
+
+        {"class": "compaction_exit", "kind": "error", "field": "err",
+         "regex": "error executing compaction",
+         "extract_many": {"field": "err",
+                          "regex": "(?P<phase>retention|compaction|downsampl\\w*|sync\\w*|clean\\w*|garbage collection) failed",
+                          "groups": ["phase"]},
+         "extract": {"block": {"field": "line",
+                               "regex": "(?P<block>[0-7][0-9A-HJKMNP-TV-Z]{25})"},
+                     "operation": {"field": "err",
+                                   "regex": "(?P<operation>upload [\\w.\\-]+\\.json|upload)"}}},
+
+        {"class": "retriable", "kind": "error", "field": "msg",
+         "regex": "retriable error"},
+
+        {"class": "disk_full", "kind": "error", "field": "line",
+         "regex": "no space left on device"},
+
+        {"class": "deletion_mark_exists", "kind": "ignore", "field": "err",
+         "regex": "deletion-mark\\.json already exists",
+         "_note": "CONFIRMED benign on this cluster: idempotent deletion-mark write racing the fetcher"},
+
+        {"class": "iteration_ok", "kind": "success", "field": "msg",
+         "regex": "^(successfully synchronized block metadata|cleaning of aborted partial uploads done)$",
+         "_note": "CONFIRMED on rancher-monitoring compactor: the fetcher/cleaner sync line recurs roughly every minute; there is no per-iteration 'succeeded' line in this build"},
+
+        {"classifier": "s3", "field": "err"}
+      ]
+    },
+
+    "thanos_querier": {
+      "namespace": "cattle-monitoring-system",
+      "selector": "app=thanos-querier",
+      "container": "thanos-querier",
+      "expect_pods": true,
+      "querier_store_hint": "store",
+      "rules": [
+        {"class": "endpoint_unhealthy", "kind": "error", "field": "msg",
+         "regex": "^update of endpoint failed$",
+         "extract": {"endpoint": {"field": "err",
+                                  "regex": "(?P<endpoint>(?:dns\\+)?[\\w.\\-]+:\\d+)"}},
+         "_note": "CONFIRMED on this build: msg='update of endpoint failed', err='getting metadata: rpc error: code = DeadlineExceeded|Unavailable'"}
+      ]
+    },
+
+    "gpu_crash": {
+      "namespace": "gpu-operator",
+      "selector": "",
+      "container": "*",
+      "only_restarted": true,
+      "previous_only": true,
+      "expect_pods": false,
+      "rules": [
+        {"class": "driver_mismatch", "kind": "error", "field": "line",
+         "regex": "Driver/library version mismatch"},
+        {"class": "nvml_init", "kind": "error", "field": "line",
+         "regex": "Failed to initialize NVML"}
+      ]
+    },
+
+    "gpu_nvupdater": {
+      "namespace": "gpu-operator",
+      "selector": "app=nvupdater",
+      "container": "nvupdater",
+      "expect_pods": true,
+      "rules": [
+        {"class": "upgrade_ok", "kind": "success", "field": "msg",
+         "regex": "(?i)(driver upgrade|node drain|validation).*(complet|succeed|done)",
+         "_note": "CONFIRM: nvupdater per-run summary line"}
+      ]
+    }
+  }
+}

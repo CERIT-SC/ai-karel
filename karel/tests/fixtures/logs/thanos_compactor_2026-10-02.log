@@ -1,0 +1,2 @@
+2026-10-02T05:10:00.000000000Z level=info ts=2026-10-02T05:10:00.000000Z caller=main.go:210 msg="starting Thanos compactor"
+2026-10-02T05:14:02.915623977Z level=info ts=2026-10-02T05:14:02.915554Z caller=compact.go:1334 msg="compaction iteration failed" err="error executing compaction: retention failed: upload deletion-mark.json of block 01KYNCB2103N438RXDYAKRKN83: AccessDenied: Access Denied\n\tstatus code: 403"

@@ -1,0 +1,217 @@
+{
+  "_comment": [
+    "Karel Prometheus queries. All are INSTANT queries - the time-window work is",
+    "pushed into PromQL (max_over_time, predict_linear, increase, changes) rather",
+    "than pulling range data and reducing it in Python. That keeps the collector",
+    "trivial and lets Prometheus do what it is good at.",
+    "",
+    "tier 1 = cheap and load-bearing, tier 2 = normal, tier 3 = expensive over",
+    "long windows. Same tier/budget semantics as the other collectors.",
+    "window_days: history the query genuinely needs. If Prometheus retention is shorter, the result is arithmetically meaningless and is suppressed rather than reported - a predict_linear over 14d computed from 30 minutes of data is not a forecast.",
+    "empty_means: 'none' for filtering expressions, where an empty result means nothing matched (good news). 'absent' where it means the metric is not scraped (a blind spot). Conflating them turns 'no node went NotReady' into 'we cannot see node readiness'.",
+    "source_job names the scrape job exporting the metrics a query needs, so a down target can be tied to the specific findings it blinds rather than reported as an unrelated fact."
+  ],
+  "queries": [
+    {
+      "name": "prom_up",
+      "expr": "up",
+      "reduce": "count_by:job",
+      "tier": 1,
+      "timeout": 15,
+      "_why": "which scrape jobs exist at all",
+      "window_days": 0,
+      "empty_means": "absent",
+      "source_job": "prometheus"
+    },
+    {
+      "name": "prom_targets_down",
+      "expr": "up == 0",
+      "reduce": "labels:job,instance",
+      "tier": 1,
+      "timeout": 15,
+      "_why": "a down target is a monitoring blind spot, and Karel is the only thing that will tell you",
+      "window_days": 0,
+      "empty_means": "none",
+      "source_job": "prometheus"
+    },
+    {
+      "name": "prom_tsdb_head_series",
+      "expr": "prometheus_tsdb_head_series",
+      "reduce": "max",
+      "tier": 2,
+      "timeout": 15,
+      "window_days": 0,
+      "empty_means": "absent",
+      "source_job": "prometheus"
+    },
+    {
+      "name": "prom_scrape_duration_p99",
+      "expr": "quantile(0.99, scrape_duration_seconds)",
+      "reduce": "scalar",
+      "tier": 2,
+      "timeout": 15,
+      "window_days": 0,
+      "empty_means": "absent",
+      "source_job": "prometheus"
+    },
+    {
+      "name": "prom_retention_days",
+      "expr": "(time() - min(prometheus_tsdb_lowest_timestamp_seconds)) / 86400",
+      "reduce": "scalar",
+      "tier": 1,
+      "timeout": 15,
+      "_why": "how far back trend claims may legitimately reach",
+      "window_days": 0,
+      "empty_means": "absent",
+      "source_job": "prometheus"
+    },
+    {
+      "name": "node_mem_peak_7d",
+      "expr": "max_over_time(sum by (node) (container_memory_working_set_bytes{container!=\"\"})[7d:5m])",
+      "reduce": "by:node",
+      "tier": 1,
+      "timeout": 45,
+      "fallback": "max_over_time(instance:node_memory_utilisation:ratio[7d]) * 100",
+      "_why": "MEASURED peak keyed by node name so it joins with the rest of the report; node_exporter series are keyed ip:port",
+      "window_days": 7,
+      "empty_means": "absent",
+      "source_job": "kubelet-cadvisor"
+    },
+    {
+      "name": "node_cpu_peak_7d",
+      "expr": "max_over_time((1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])))[7d:5m]) * 100",
+      "reduce": "by:instance",
+      "tier": 2,
+      "timeout": 60,
+      "window_days": 7,
+      "empty_means": "absent",
+      "source_job": "node-exporter"
+    },
+    {
+      "name": "node_mem_working_set_peak_7d",
+      "expr": "max_over_time(sum by (node) (container_memory_working_set_bytes{container!=\"\"})[7d:5m])",
+      "reduce": "by:node",
+      "tier": 2,
+      "timeout": 60,
+      "_why": "peak of what pods actually consumed, per node",
+      "window_days": 7,
+      "empty_means": "absent",
+      "source_job": "kubelet-cadvisor"
+    },
+    {
+      "name": "apiserver_5xx_rate_24h",
+      "expr": "sum(increase(apiserver_request_total{code=~\"5..\"}[24h])) / clamp_min(sum(increase(apiserver_request_total[24h])), 1)",
+      "reduce": "scalar",
+      "tier": 1,
+      "timeout": 30,
+      "_why": "per-instance scraping makes this a real rate; the /metrics scrape could never do it",
+      "window_days": 1,
+      "empty_means": "absent",
+      "source_job": "apiserver"
+    },
+    {
+      "name": "apiserver_latency_p99_24h",
+      "expr": "histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{verb!~\"WATCH|CONNECT\"}[24h])))",
+      "reduce": "scalar",
+      "tier": 2,
+      "timeout": 45,
+      "window_days": 1,
+      "empty_means": "absent",
+      "source_job": "apiserver"
+    },
+    {
+      "name": "apiserver_restarts_24h",
+      "expr": "sum(changes(process_start_time_seconds{job=~\".*apiserver.*\"}[24h]))",
+      "reduce": "scalar",
+      "tier": 2,
+      "timeout": 30,
+      "window_days": 1,
+      "empty_means": "absent"
+    },
+    {
+      "name": "etcd_db_predict_30d",
+      "expr": "predict_linear(etcd_mvcc_db_total_size_in_bytes[14d], 30*86400)",
+      "reduce": "max",
+      "tier": 2,
+      "timeout": 45,
+      "_why": "Prometheus does the regression; no two-point extrapolation",
+      "window_days": 14,
+      "empty_means": "absent",
+      "source_job": "etcd"
+    },
+    {
+      "name": "etcd_leader_changes_24h",
+      "expr": "sum(increase(etcd_server_leader_changes_seen_total[24h]))",
+      "reduce": "scalar",
+      "tier": 1,
+      "timeout": 30,
+      "_why": "the transient that daily snapshots cannot see at all",
+      "window_days": 1,
+      "empty_means": "absent",
+      "source_job": "etcd"
+    },
+    {
+      "name": "etcd_fsync_p99_24h",
+      "expr": "histogram_quantile(0.99, sum by (le) (rate(etcd_disk_wal_fsync_duration_seconds_bucket[24h])))",
+      "reduce": "scalar",
+      "tier": 2,
+      "timeout": 45,
+      "window_days": 1,
+      "empty_means": "absent",
+      "source_job": "etcd"
+    },
+    {
+      "name": "pod_oomkills_24h",
+      "expr": "sum by (namespace, pod) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[24h])) > 0",
+      "reduce": "labels:namespace,pod",
+      "tier": 1,
+      "timeout": 45,
+      "_why": "the single biggest thing the 1h event TTL hides",
+      "window_days": 1,
+      "empty_means": "none",
+      "source_job": "kube-state-metrics"
+    },
+    {
+      "name": "pod_restarts_24h",
+      "expr": "topk(15, sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[24h])) > 0)",
+      "reduce": "labels:namespace,pod",
+      "tier": 1,
+      "timeout": 45,
+      "window_days": 1,
+      "empty_means": "none",
+      "source_job": "kube-state-metrics"
+    },
+    {
+      "name": "pod_pending_minutes_24h",
+      "expr": "topk(10, sum by (namespace, pod) (sum_over_time(kube_pod_status_phase{phase=\"Pending\"}[24h:1m])) > 15)",
+      "reduce": "labels:namespace,pod",
+      "tier": 2,
+      "timeout": 45,
+      "window_days": 1,
+      "empty_means": "none",
+      "source_job": "kube-state-metrics"
+    },
+    {
+      "name": "node_notready_minutes_24h",
+      "expr": "sum by (node) (sum_over_time((kube_node_status_condition{condition=\"Ready\",status=\"true\"} == 0)[24h:1m]))",
+      "reduce": "by:node",
+      "tier": 1,
+      "timeout": 45,
+      "_why": "a node that flapped overnight and recovered",
+      "window_days": 1,
+      "empty_means": "none",
+      "source_job": "kube-state-metrics"
+    },
+    {
+      "name": "pvc_used_pct_max",
+      "expr": "topk(10, 100 * kubelet_volume_stats_used_bytes / clamp_min(kubelet_volume_stats_capacity_bytes, 1))",
+      "reduce": "labels:namespace,persistentvolumeclaim",
+      "tier": 2,
+      "timeout": 45,
+      "_why": "PVC fullness is invisible from the Kubernetes API alone",
+      "window_days": 0,
+      "empty_means": "absent",
+      "source_job": "kubelet"
+    }
+  ]
+}
