@@ -522,4 +522,28 @@ check("only the sidecar endpoint -> the finding fires",
           rules_logs.r_thanos_querier(b)))
 
 
+# --------------------------------------------------------------------------
+print("\ngpu_crash: GFD strategy line is its own class, attributed per pod+node")
+
+ag = logscan.Aggregator(
+    json.load(open(os.path.join(ROOT, "config", "log-checks.json")))
+    ["checks"]["gpu_crash"], since=SINCE, now=NOW)
+ag.feed("2026-10-07T12:00:00.123456789Z E1012 12:00:00.000000       1 "
+        "main.go:64] failed to create resource manager: unsupported "
+        "strategy auto",
+        source="previous", pod="gpu-feature-discovery-b8zbq", node="gpu-01")
+ag.feed("2026-10-07T12:00:10.123456789Z E1012 12:00:10.000000       1 "
+        "main.go:64] failed to create resource manager: unsupported "
+        "strategy auto",
+        source="previous", pod="gpu-feature-discovery-t7qmn", node="gpu-02")
+classes, _ignored = ag.finalize()
+c = classes.get("gfd_strategy_auto") or {}
+check("the unsupported-strategy line matches gfd_strategy_auto",
+      c.get("count") == 2, sorted(classes))
+check("the match names the exact pods", c.get("pods") ==
+      ["gpu-feature-discovery-b8zbq", "gpu-feature-discovery-t7qmn"], c)
+check("and the exact nodes (the recipe is per node)",
+      c.get("nodes") == ["gpu-01", "gpu-02"], c)
+
+
 finish()

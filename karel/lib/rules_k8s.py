@@ -445,13 +445,22 @@ def r_workloads(bundle):
                           "and pull secret, and whether the tag still exists"]
                          if pulls else [])))
 
-    oom, n = _platform(bundle, "k8s.pod.oomkilled")
-    if oom:
+    # OOMKills are listed for EVERY namespace, not platform-only: an OOMKill
+    # is a cluster fact (the node adds a counter and a kubelet event) and the
+    # tenant table's summary row is no place to hide a nameable pod.
+    oom_all = _f(bundle, "k8s.pod.oomkilled", []) or []
+    oom_total = _f(bundle, "k8s.pod.oomkilled_count") or len(oom_all)
+    if oom_all:
+        plat_n = _f(bundle, "k8s.pod.oomkilled.platform_count")
+        split_n = (" - %d platform, %d tenant"
+                   % (plat_n, max(0, oom_total - plat_n))) \
+            if plat_n is not None else ""
         out.append(_finding(
             "K8S_OOMKILLED", "warn",
-            "%s%d platform container(s) show a recent OOMKill"
-            % (_atleast(bundle, "k8s.pod.oomkilled"), n),
-            detail=_more(oom, n), evidence=["k_pods"], metric=float(n),
+            "%s%d container(s) show a recent OOMKill%s"
+            % (_atleast(bundle, "k8s.pod.oomkilled"), oom_total, split_n),
+            detail=_more(oom_all, oom_total, shown=40),
+            evidence=["k_pods"], metric=float(oom_total),
             remediation=["raise the memory limit or fix the leak - an OOMKilled "
                          "logging, storage or network agent drops data or I/O on "
                          "that node"]))

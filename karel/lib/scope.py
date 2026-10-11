@@ -25,7 +25,7 @@ import fnmatch
 import os
 
 DEFAULT_PLATFORM_NAMESPACES = (
-    "kube-*", "cattle-*", "*-system", "*-operator",
+    "kube-*", "cattle-*", "*-system", "*operator*",
     "calico-*", "tigera-*", "cert-manager", "ingress-nginx", "gpu-operator",
     "csi-*", "metallb*", "kubewarden", "cloudnativepg", "rook-*", "longhorn*",
 )

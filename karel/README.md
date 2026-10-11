@@ -381,6 +381,16 @@ problem is never reported three times). `k_clusterpolicy` adds the operator's
 own rollcall when the CRD is readable; driver skew across nodes is
 `K8S_GPU_DRIVER_SKEW`.
 
+`K8S_GPU_GFD_STRATEGY` is the one recipe the report can hand out exactly: when
+a `gpu-feature-discovery` pod CrashLoopBackOffs and its previous log says
+`failed to create resource manager: unsupported strategy auto`, the
+nvidia-container-toolkit on **that node** is the broken part, and the finding
+names the exact pods to delete (`kubectl -n gpu-operator delete pod
+nvidia-container-toolkit-daemonset-…` — GFD then follows on its own). Log
+checks attribute every matched error class to the pods and nodes that
+produced it, so a node whose GFD fails for a different reason gets no bogus
+recipe.
+
 The **Node versions** table (kernel, kubelet/RKE2, containerd, OS image, GPU
 driver on GPU nodes) shows each version with its node count, majority first,
 and names the laggards: the target is the majority version unless
@@ -625,7 +635,7 @@ problem list (backoff, OOMKill, Pending, degraded workloads, failed Jobs,
 overdue CronJobs, unbound PVCs, paused rollouts, co-located replicas) is split
 by namespace:
 
-* **platform** - `kube-*`, `cattle-*`, `*-system`, `*-operator`, `calico-*`,
+* **platform** - `kube-*`, `cattle-*`, `*-system`, `*operator*`, `calico-*`,
   `tigera-*`, `cert-manager`, `ingress-nginx`, `gpu-operator`, `csi-*`,
   `metallb*`, `kubewarden`, `cloudnativepg`, `rook-*`, `longhorn*`, plus
   `KAREL_PLATFORM_NAMESPACES`. These are individual findings at normal severity.
@@ -655,7 +665,12 @@ useless (pod names change on every redeploy), so restarts are keyed by owner
 Karel surfaces Pending pods, CrashLoop/ImagePull backoff, recent OOMKills,
 CronJobs that stopped running, failed Jobs, PVCs that are not Bound, stuck
 VolumeAttachments, and fail-closed webhooks whose backing Service has no ready
-endpoints (a cluster-wide write outage).
+endpoints (a cluster-wide write outage). A "recent" OOMKill is one whose
+`lastState.terminated.finishedAt` is inside the last 48h — every one of them
+is listed by name, in all namespaces (platform and tenant), with the kill's
+age next to the entry (`killed 9h ago`); a chronically-OOMing container is
+followed by the restart counter and K8S_RESTART_SPIKE rather than by a finding
+that never clears.
 
 A stuck VolumeAttachment is reported with its volume, target node, CSI driver
 and the pod waiting on that claim, not just the attachment's internal CSI

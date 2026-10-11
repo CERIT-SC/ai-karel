@@ -23,6 +23,9 @@ SAMPLE_LIMIT = 3
 SAMPLE_CHARS = 300
 EXTRACT_LIMIT = 50
 FREQ_LIMIT = 5
+# Per-class pod/node attribution is capped the same way: the gpu-operator
+# checks run over one DaemonSet family per node, so 50 covers any cluster.
+WHERE_LIMIT = 50
 
 
 # ---------------------------------------------------------------- timestamps
@@ -317,6 +320,8 @@ class ClassAgg(object):
         self.entries = {}            # key -> {"entry","count","first","last"}
         self.samples = []
         self.freq = {}
+        self.pods = set()            # attribution: which pods hit this class
+        self.nodes = set()
 
     def note_ts(self, ts):
         if ts is None:
@@ -325,6 +330,15 @@ class ClassAgg(object):
             self.first = ts
         if self.last is None or ts > self.last:
             self.last = ts
+
+    def add_where(self, pod=None, node=None):
+        """Which pod (on which node) produced this class. Without it, a class
+        matched by a DaemonSet pod on one node is indistinguishable from the
+        same pod on another node - and the fix is per node."""
+        if pod and len(self.pods) < WHERE_LIMIT:
+            self.pods.add(str(pod))
+        if node and len(self.nodes) < WHERE_LIMIT:
+            self.nodes.add(str(node))
 
     def add_extract(self, name, value):
         if value is None:
@@ -389,6 +403,10 @@ class ClassAgg(object):
             out["freq"] = [[k, v] for k, v in
                            sorted(self.freq.items(),
                                   key=lambda kv: (-kv[1], kv[0]))[:FREQ_LIMIT]]
+        if self.pods:
+            out["pods"] = sorted(self.pods)
+        if self.nodes:
+            out["nodes"] = sorted(self.nodes)
         return out
 
 
@@ -418,7 +436,7 @@ class Aggregator(object):
             a = self.classes[name] = ClassAgg(kind)
         return a
 
-    def feed(self, line, source="current"):
+    def feed(self, line, source="current", pod=None, node=None):
         self.lines += 1
         ts, rest = split_timestamp(line)
         fields, _plain = parse_line(rest)
@@ -429,7 +447,7 @@ class Aggregator(object):
                 and not s3_benign(fields.get("err")):
             cls, kind = "unclassified", "error"
             self._record_error("unclassified", kind, fields, ts, source,
-                               freq=True)
+                               freq=True, pod=pod, node=node)
             return cls
 
         if rule is None:
@@ -460,6 +478,7 @@ class Aggregator(object):
             a.present_in.add(source)
             a.count += 1
             a.note_ts(ts)
+            a.add_where(pod, node)
             self._extract(rule, a, fields, rest, ts)
         elif kind == "success":
             if self._in_window(ts):
@@ -471,7 +490,7 @@ class Aggregator(object):
                 self._extract(rule, a, fields, rest, ts)
         else:
             self._record_error(cls, kind, fields, ts, source,
-                               rule=rule, line=rest)
+                               rule=rule, line=rest, pod=pod, node=node)
             # A matched error rule wins the primary class, but an S3-shaped
             # err gets its shared class too ("error executing compaction" +
             # "Access Denied" is compaction_exit AND s3_auth; the rule title
@@ -480,16 +499,17 @@ class Aggregator(object):
                 extra = s3_classify(fields.get("err"))
                 if extra and extra != cls:
                     self._record_error(extra, "error", fields, ts, source,
-                                       line=rest)
+                                       line=rest, pod=pod, node=node)
         return cls
 
     def _record_error(self, cls, kind, fields, ts, source, rule=None,
-                      line=None, freq=False):
+                      line=None, freq=False, pod=None, node=None):
         if not self._in_window(ts):
             return
         a = self._agg(cls, "error")
         a.count += 1
         a.note_ts(ts)
+        a.add_where(pod, node)
         if rule is not None:
             self._extract(rule, a, fields, line, ts)
         a.add_sample(line if line is not None else fields.get("_line", ""))

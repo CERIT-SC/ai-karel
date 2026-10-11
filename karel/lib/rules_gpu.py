@@ -312,6 +312,71 @@ def r_gpu_upgrade(bundle):
     return out
 
 
+def r_gpu_gfd_strategy(bundle):
+    """gpu-feature-discovery CrashLoops with a distinct last log line -
+    'failed to create resource manager: unsupported strategy auto' - which is
+    the nvidia-container-toolkit on that node having a broken/stale CDI
+    layout config, not a GFD defect. The fix is per node: restart the toolkit
+    pod so it rewrites its config, and GFD follows.
+
+    The pairing (which toolkit pod) needs the random DaemonSet suffix, so it
+    is stated exactly: gpu-feature-discovery-b8zbq and the toolkit pod from
+    k8s.pod.gpu_operator_pods_by_node on the SAME node. Attribution comes
+    from the gpu_crash log check's per-node marking; a node whose line was
+    never seen keeps its generic finding instead of a wrong recipe.
+    """
+    out = []
+    by_node = _f(bundle, "k8s.pod.gpu_operator_pods_by_node", {}) or {}
+    if not by_node:
+        return out
+    cls = _f(bundle, "k8s.log.gpu_crash.class.gfd_strategy_auto", {}) or {}
+    if not cls.get("count"):
+        return out          # check saw nothing (or never ran): no recipe
+    hit_nodes = set(cls.get("nodes") or [])
+
+    lines, restart_cmds = [], []
+    for node, pods in sorted(by_node.items()):
+        gfd = [p for p in pods
+               if str(p.get("owner") or "").endswith("/gpu-feature-discovery")
+               and p.get("waiting_reason") == "CrashLoopBackOff"]
+        if not gfd:
+            continue
+        if hit_nodes and node not in hit_nodes:
+            continue      # this node's GFD fails for a different reason
+        tk = [p["pod"] for p in pods
+              if str(p.get("owner") or "").endswith(
+                  "/nvidia-container-toolkit-daemonset")]
+        short = str(node).split(".")[0]
+        for p in gfd:
+            lines.append("%s: Crashed gpu-feature-discovery pod `%s` - "
+                         "restart `%s`" % (short, p["pod"],
+                                           tk[0] if tk else
+                                           "the nvidia-container-toolkit-"
+                                           "daemonset pod on this node"))
+        if tk:
+            restart_cmds.append(
+                "kubectl -n gpu-operator delete pod %s  # on %s"
+                % (tk[0], short))
+    if not lines:
+        return out
+    out.append(_finding(
+        "K8S_GPU_GFD_STRATEGY", "warn",
+        "gpu-feature-discovery CrashLoopBackOff on %d node(s): its log says "
+        "'failed to create resource manager: unsupported strategy auto'"
+        % len(lines),
+        detail=lines + ["GFD is the victim here: the toolkit on the node "
+                        "rewrites its config on start, and GFD comes up "
+                        "clean right after"],
+        evidence=["k_pods", "k_log_gpu_crash"], metric=float(len(lines)),
+        remediation=(restart_cmds or
+                     ["delete the nvidia-container-toolkit-daemonset pod on "
+                      "each of the node(s) above, then let GFD restart"]) +
+                    ["do NOT scale/delete gpu-feature-discovery first - it "
+                     "will just CrashLoop again until the toolkit is "
+                     "restarted"]))
+    return out
+
+
 # ------------------------------------------------------- node versions table
 def _version_map(bundle, nodes, attr, subset=None):
     out = {}
@@ -418,6 +483,7 @@ def r_kernel_skew(bundle):
 
 RULES = [
     r_gpu_health,
+    r_gpu_gfd_strategy,
     r_kernel_skew,
     r_node_versions,
     r_gpu_upgrade,

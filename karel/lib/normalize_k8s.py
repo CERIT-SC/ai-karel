@@ -419,6 +419,17 @@ def _int(v):
 
 
 # ----------------------------------------------------------------------- pods
+# How old a container's last OOMKill may be and still count as "recent". The
+# kill time comes from lastState.terminated.finishedAt (exact, like the Failed
+# path); a container that OOMed once and then ran clean keeps that lastState
+# forever, so without this bound the same kill is reported forever. Two days
+# handles a delayed run (a kill from just after the last collection would
+# otherwise fall silent); a chronically-OOMing container still keeps
+# re-killing, so its ongoing story is the restart counter and
+# K8S_RESTART_SPIKE rather than a finding that never clears.
+OOMKILL_RECENT_DAYS = 2.0
+
+
 def p_pods(o, F, src):
     items = _items(o)
     F.add("k8s.pod.count", len(items), src)
@@ -441,6 +452,7 @@ def p_pods(o, F, src):
     failed_pods = {}            # ns -> [{pod, owner, reason, finished_at, created}] ( trimmed )
     terminating_info = []       # pods with a deletionTimestamp, for finalizer stalls
     gpu_op = {}                 # node -> gpu-operator pod health recap
+    gpu_op_pods = {}            # node -> all gpu-operator pods (exact names)
     failed_total = 0
     failed_old_by_ns = {}
     recent_total = 0
@@ -538,7 +550,21 @@ def p_pods(o, F, src):
             # one node is a broken node, not a broken DaemonSet.
             where = " on %s" % node.split(".")[0] if node else ""
             if last.get("reason") == "OOMKilled":
-                oomkilled.append("%s:%s%s" % (nn, cs.get("name"), where))
+                # lastState is the PREVIOUS termination and survives until the
+                # next one, so a container that OOMed long ago and has run
+                # cleanly since still reads reason=OOMKilled here. Only a kill
+                # inside the window is news; older ones ride with restart
+                # deltas instead of being re-announced every run. The kill's
+                # age rides along, so the reader never has to guess "recent".
+                age = _age_days(last.get("finishedAt"))
+                if age is None or age < OOMKILL_RECENT_DAYS:
+                    when = ""
+                    if age is not None:
+                        when = " (killed %s ago)" % \
+                            ("%.0fh" % (age * 24) if age < 2 else
+                             "%.0fd" % age)
+                    oomkilled.append("%s:%s%s%s" % (nn, cs.get("name"),
+                                                    where, when))
             waiting = (cs.get("state") or {}).get("waiting") or {}
             if waiting.get("reason") in ("CrashLoopBackOff", "ImagePullBackOff",
                                          "ErrImagePull", "CreateContainerConfigError"):
@@ -604,6 +630,15 @@ def p_pods(o, F, src):
                 "ready": bool(phase == "Running" and conds.get("Ready") == "True"),
                 "waiting_reason": wait, "restarts": total_restarts,
             }
+            # ALL gpu-operator pods on the node, exact names. gpu_op keeps one
+            # recap per node; the DaemonSet family really carries several pods
+            # per node, and the per-node pairings (gpu-feature-discovery ->
+            # nvidia-container-toolkit) need the exact random suffixes.
+            gpu_op_pods.setdefault(node, []).append({
+                "pod": name, "owner": owner,
+                "ready": bool(phase == "Running" and conds.get("Ready") == "True"),
+                "waiting_reason": wait, "restarts": total_restarts,
+            })
 
         # Scheduling pins matter for drain simulation - but only REAL pins.
         # A DaemonSet pod is one-per-node by design: it does not "fail to
@@ -696,6 +731,10 @@ def p_pods(o, F, src):
         F.add("k8s.pod.terminating_info", terminating_info[:60], src)
     if gpu_op:
         F.add("k8s.pod.gpu_operator_by_node", gpu_op, src)
+    if gpu_op_pods:
+        F.add("k8s.pod.gpu_operator_pods_by_node",
+              {n: sorted(v, key=lambda p: (p["owner"], p["pod"]))
+               for n, v in gpu_op_pods.items()}, src)
     if gpu_users:
         F.add("k8s.pod.gpu_users", {k: sorted(v) for k, v in gpu_users.items()}, src)
     if gpu_requests:

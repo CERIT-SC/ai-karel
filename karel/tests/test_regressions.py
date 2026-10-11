@@ -337,6 +337,10 @@ check("kube-system, cattle-*, *-system, *-operator are platform",
                                        "csi-storage", "gpu-operator")))
 check("tenant namespaces are not platform",
       not any(_sc.is_platform(n) for n in ("gdi-ega-ns", "default", "acgt-app")))
+check("any namespace containing 'operator' is platform",
+      all(_sc.is_platform(n) for n in ("postgresoperator", "ray-operator",
+                                       "flink-operator-system", "operators")),
+      [_sc.is_platform(n) for n in ("postgresoperator", "operators")])
 os.environ["KAREL_PLATFORM_NAMESPACES"] = "beegfs, clusterwide-*"
 check("KAREL_PLATFORM_NAMESPACES extends the defaults",
       _sc.is_platform("beegfs") and _sc.is_platform("clusterwide-traefik")
@@ -354,6 +358,61 @@ fv = {k: v["value"] for k, v in b["facts"].items()}
 check("tenant count comes from the total, not len(sample)",
       fv["k8s.pod.oomkilled.tenant_count"] == 106, fv.get("k8s.pod.oomkilled.tenant_count"))
 check("a sampled list is marked partial", fv.get("k8s.pod.oomkilled.partial") is True)
+
+# lastState.terminated survives until the container's NEXT termination, so an
+# OOMKill from months ago is still visible on every run. Only kills inside
+# OOMKILL_RECENT_DAYS may be announced - otherwise the same old kill re-fires
+# forever.
+import datetime as _dt  # noqa: E402
+
+
+def _oom_pod(finished_at):
+    term = {"reason": "OOMKilled", "exitCode": 137}
+    if finished_at:
+        term["finishedAt"] = finished_at
+    return {"items": [{
+        "metadata": {"namespace": "kube-system", "name": "agent-1"},
+        "spec": {"nodeName": "n1", "containers": [{"name": "main"}]},
+        "status": {"phase": "Running",
+                   "containerStatuses": [{"name": "main", "restartCount": 3,
+                                          "state": {"running": {}},
+                                          "lastState": {"terminated": term}}]}}]}
+
+
+def _days_ago(d):
+    return (_dt.datetime.utcnow() - _dt.timedelta(days=d)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+F = normalize.Facts()
+normalize_k8s.p_pods(_oom_pod(_days_ago(0.5)), F, "t")
+check("a recent OOMKill is reported, with its age visible",
+      F.get_value("k8s.pod.oomkilled")
+      == ["kube-system/agent-1:main on n1 (killed 12h ago)"],
+      F.get_value("k8s.pod.oomkilled"))
+F = normalize.Facts()
+normalize_k8s.p_pods(_oom_pod(_days_ago(3)), F, "t")
+check("an OOMKill older than two days is not re-reported",
+      F.get_value("k8s.pod.oomkilled") == [], F.get_value("k8s.pod.oomkilled"))
+F = normalize.Facts()
+normalize_k8s.p_pods(_oom_pod(_days_ago(30)), F, "t")
+check("nor one from weeks ago",
+      F.get_value("k8s.pod.oomkilled") == [], F.get_value("k8s.pod.oomkilled"))
+
+# OOMKills are news for every namespace: a kill in a tenant namespace is a
+# cluster fact, not tenant-only bookkeeping. The finding lists both.
+b = facts({"k8s.pod.oomkilled": ["kube-system/a:c on n1 (killed 9h ago)",
+                                 "ml-team-ns/q:c on n2 (killed 20h ago)"],
+           "k8s.pod.oomkilled_count": 2})
+_sc.derive(b)
+fs = _rk.r_workloads(b)
+oom_f = [f for f in fs if f["id"] == "K8S_OOMKILLED"]
+check("the finding lists tenant OOMKills alongside platform ones",
+      len(oom_f) == 1 and "ml-team-ns/q:c" in str(oom_f[0]["detail"])
+      and "kube-system/a:c" in str(oom_f[0]["detail"]), fs)
+check("and states the platform/tenant split",
+      len(oom_f) == 1 and "1 platform, 1 tenant" in oom_f[0]["title"],
+      oom_f[0]["title"] if oom_f else None)
 
 F = normalize.Facts()
 normalize_k8s._problem_list(F, "t", "k8s.pod.backoff",

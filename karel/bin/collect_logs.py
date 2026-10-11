@@ -222,7 +222,7 @@ def run_check(name, check, since, now, limit, max_pods):
                         "--limit-bytes=%d truncated the log" % limit)
                 for line in text.splitlines():
                     if line.strip():
-                        agg.feed(line, source=src)
+                        agg.feed(line, source=src, pod=pname, node=node)
 
             st = logscan.parse_ts(started)
             if st is not None and since is not None and st > since:

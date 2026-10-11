@@ -283,4 +283,73 @@ check("the DRA-only node is not called dark",
               and "kub-a7" in str(f["detail"]) for f in fs), fs)
 
 
+# --------------------------------------------------------------------------
+print("\nGFD crashloop + strategy line -> restart the toolkit pod ON that node")
+
+
+def gfd(node, name, waiting="CrashLoopBackOff"):
+    return {"metadata": {"namespace": "gpu-operator", "name": name,
+                         "ownerReferences": [{"kind": "DaemonSet",
+                                              "name": "gpu-feature-discovery"}]},
+            "spec": {"nodeName": node, "containers": [{"name": "main"}]},
+            "status": {"phase": "Pending",
+                       "containerStatuses": [
+                           {"name": "main", "restartCount": 23,
+                            "state": {"waiting": {"reason": waiting}}}]}}
+
+
+def toolkit(node, name):
+    return {"metadata": {"namespace": "gpu-operator", "name": name,
+                         "ownerReferences": [{"kind": "DaemonSet",
+                                              "name": "nvidia-container-toolkit-daemonset"}]},
+            "spec": {"nodeName": node, "containers": [{"name": "main"}]},
+            "status": {"phase": "Running",
+                       "conditions": [{"type": "Ready", "status": "True"}],
+                       "containerStatuses": [
+                           {"name": "main", "restartCount": 0,
+                            "state": {"running": {}}}]}}
+
+
+pods = {"items": [
+    gfd("gpu-01", "gpu-feature-discovery-b8zbq"),
+    toolkit("gpu-01", "nvidia-container-toolkit-daemonset-x9k2p"),
+    gfd("gpu-02", "gpu-feature-discovery-t7qmn"),
+    toolkit("gpu-02", "nvidia-container-toolkit-daemonset-p2w8z"),
+]}
+F = normalize.Facts()
+normalize_k8s.p_pods(pods, F, "k_pods")
+p = F.get_value("k8s.pod.gpu_operator_pods_by_node", {})
+check("every gpu-operator pod is listed per node with its exact name",
+      [x["pod"] for x in p.get("gpu-01", [])] ==
+      ["gpu-feature-discovery-b8zbq",
+       "nvidia-container-toolkit-daemonset-x9k2p"], p)
+
+b = facts({k: v["value"] for k, v in F.items()})
+check("no log evidence -> no recipe (absent is not zero)",
+      rules_gpu.r_gpu_gfd_strategy(b) == [])
+b["facts"]["k8s.log.gpu_crash.class.gfd_strategy_auto"] = {
+    "value": {"kind": "error", "count": 4,
+              "pods": ["gpu-feature-discovery-b8zbq"],
+              "nodes": ["gpu-01"]}, "source": "t"}
+fs = rules_gpu.r_gpu_gfd_strategy(b)
+check("K8S_GPU_GFD_STRATEGY fires with the exact toolkit pod name",
+      len(fs) == 1 and fs[0]["id"] == "K8S_GPU_GFD_STRATEGY"
+      and "nvidia-container-toolkit-daemonset-x9k2p" in str(fs[0]["detail"])
+      and "nvidia-container-toolkit-daemonset-x9k2p"
+      in str(fs[0]["remediation"]), fs)
+check("the node the log never named gets no recipe",
+      "gpu-02" not in str(fs[0]["detail"] + fs[0]["remediation"]),
+      fs[0]["detail"])
+b["facts"]["k8s.log.gpu_crash.class.gfd_strategy_auto"] = {
+    "value": {"kind": "error", "count": 8,
+              "pods": ["gpu-feature-discovery-b8zbq",
+                       "gpu-feature-discovery-t7qmn"],
+              "nodes": ["gpu-01", "gpu-02"]}, "source": "t"}
+fs = rules_gpu.r_gpu_gfd_strategy(b)
+check("both flagged nodes get their own exact restart command",
+      len(fs) == 1
+      and all(n in str(fs[0]["remediation"]) for n in
+              ("x9k2p", "p2w8z")), fs[0]["remediation"])
+
+
 finish()

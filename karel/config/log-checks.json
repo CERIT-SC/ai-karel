@@ -117,7 +117,10 @@
         {"class": "driver_mismatch", "kind": "error", "field": "line",
          "regex": "Driver/library version mismatch"},
         {"class": "nvml_init", "kind": "error", "field": "line",
-         "regex": "Failed to initialize NVML"}
+         "regex": "Failed to initialize NVML"},
+        {"class": "gfd_strategy_auto", "kind": "error", "field": "line",
+         "regex": "failed to create resource manager: unsupported strategy",
+         "_note": "CONFIRMED on gpu-feature-discovery: the last line before it exits, when the nvidia-container-toolkit CDI/config is broken; restarting the toolkit pod ON THE SAME node rewrites the config and gpu-feature-discovery comes up clean"}
       ]
     },
 
