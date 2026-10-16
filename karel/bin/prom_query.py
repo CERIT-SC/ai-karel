@@ -154,11 +154,39 @@ def reduce_result(result, mode):
     return _num(result[0].get("value", [None, None])[1]), n
 
 
+# Object-identifying labels of the kube-prometheus/rancher default ruleset, in
+# pick order. Subject labels first - aggregated rules (quota, HPA, daemonsets)
+# keep the scrape source's pod as plumbing, so `pod` ranks last. A generic
+# histogram over whichever of these an alert carries is what lets the rules
+# layer aggregate 1,400 KubeJobFailed into "the failing jobs of one tenant"
+# without knowing each rule's label schema.
+_GROUP_OBJECT_LABELS = ("persistentvolumeclaim", "job_name", "resourcequota",
+                        "horizontalpodautoscaler", "deployment", "statefulset",
+                        "daemonset", "node", "pod")
+_GROUP_CAP = 100  # per histogram; the drop is recorded, never silent
+
+
+def _hist_add(hist, key):
+    """key -> hist[key] += 1, capped. Returns 1 when the add was dropped."""
+    if key in hist or len(hist) < _GROUP_CAP:
+        hist[key] = hist.get(key, 0) + 1
+        return 0
+    return 1
+
+
 def fetch_alerts():
     """Active alerts. Alertmanager already encodes what this org thinks matters -
-    ignoring it would mean Karel re-deriving judgements someone made deliberately."""
+    ignoring it would mean Karel re-deriving judgements someone made deliberately.
+
+    Alerts fire per label-set, not per problem: one tenant's failing CronJob is
+    1,400 KubeJobFailed. Aggregation therefore happens here, in the collector -
+    what crosses into the bundle is counts per alertname with namespace and
+    object histograms, first/last firing times, and a bounded sample, never the
+    full alert stream.
+    """
     for path in ("/api/v2/alerts?silenced=false&inhibited=false&active=true",
                  "/api/v1/alerts"):
+        last = "no response"
         try:
             doc = _get(ALERTMANAGER_URL.rstrip("/") + path, 20)
         except Exception as exc:
@@ -166,18 +194,45 @@ def fetch_alerts():
             continue
         items = doc if isinstance(doc, list) else (doc.get("data") or {}).get("alerts", [])
         out = []
+        groups = {}
         for a in items or []:
             labels = a.get("labels") or {}
             ann = a.get("annotations") or {}
-            out.append({
+            entry = {
                 "name": labels.get("alertname"),
                 "severity": labels.get("severity"),
                 "namespace": labels.get("namespace"),
                 "instance": labels.get("instance") or labels.get("pod"),
                 "summary": (ann.get("summary") or ann.get("description") or "")[:200],
                 "startsAt": a.get("startsAt"),
-            })
-        return {"available": True, "count": len(out), "alerts": out[:60]}
+            }
+            out.append(entry)
+
+            g = groups.setdefault(entry["name"] or "?", {
+                "count": 0, "severities": {}, "namespaces": {}, "objects": {},
+                "ns_dropped": 0, "obj_dropped": 0,
+                "oldest": None, "newest": None, "samples": []})
+            g["count"] += 1
+            sev = (labels.get("severity") or "unknown").lower()
+            g["severities"][sev] = g["severities"].get(sev, 0) + 1
+            ns = labels.get("namespace")
+            if ns:
+                g["ns_dropped"] += _hist_add(g["namespaces"], ns)
+            obj = next((labels.get(k) for k in _GROUP_OBJECT_LABELS
+                        if labels.get(k)), None)
+            if obj:
+                g["obj_dropped"] += _hist_add(
+                    g["objects"], "%s/%s" % (ns, obj) if ns else obj)
+            starts = a.get("startsAt")
+            if starts:
+                if not g["oldest"] or starts < g["oldest"]:
+                    g["oldest"] = starts
+                if not g["newest"] or starts > g["newest"]:
+                    g["newest"] = starts
+            if len(g["samples"]) < 3:
+                g["samples"].append(entry)
+        return {"available": True, "count": len(out), "alerts": out[:60],
+                "groups": groups}
     return {"available": False, "error": last}
 
 

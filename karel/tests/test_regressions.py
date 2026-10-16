@@ -945,20 +945,78 @@ check("absent metrics reported as absent", "KAREL_PROM_METRICS_ABSENT" in codes,
 check("reduce failure raises a finding", "KAREL_PROM_REDUCE_FAILED" in codes, codes)
 
 codes = {f["code"] for f in _np.r_prom_alerts(_pb)}
-check("Alertmanager alerts surfaced", "PROM_ACTIVE_ALERTS" in codes, codes)
+check("Alertmanager alerts surfaced, categorised",
+      "PROM_ALERTS_CONTROL_PLANE" in codes, codes)
 sev = [f["severity"] for f in _np.r_prom_alerts(_pb)]
-check("a critical alert makes the finding critical", "crit" in sev, sev)
+check("a critical alert makes its category critical", "crit" in sev, sev)
 
 # the always-firing watchdog is not a finding; a watchdog-only state is confirmed
 _wd = {"reachable": True, "queries": {}, "targets": {"available": False},
-       "alerts": {"available": True, "count": 1, "alerts": [
-           {"name": "Watchdog", "severity": "none", "summary": "always firing"}]}}
+       "alerts": {"available": True, "count": 2, "alerts": [
+           {"name": "Watchdog", "severity": "none", "summary": "always firing"},
+           {"name": "InfoInhibitor", "severity": "none",
+            "summary": "inhibits info alerts"}]}}
 _wb, _ = _prom_bundle(_wd)
 _wf = _np.r_prom_alerts(_wb)
-check("the always-firing watchdog is not reported as a finding",
-      not any(f["code"] == "PROM_ACTIVE_ALERTS" for f in _wf), _wf)
+check("watchdog and InfoInhibitor are not reported as findings",
+      not any(f["code"].startswith("PROM_ALERTS") for f in _wf), _wf)
 check("but a watchdog-only state is confirmed positively",
       any(f["code"] == "PROM_NO_REAL_ALERTS" for f in _wf), _wf)
+
+# grouped alerts: 1,400 KubeJobFailed is one tenant's backlog, not 1,400 lines
+_grp = {"reachable": True, "queries": {}, "targets": {"available": False},
+        "alerts": {"available": True, "count": 1411, "alerts": [], "groups": {
+    "KubeJobFailed": {"count": 1400, "severities": {"warning": 1400},
+                      "namespaces": {"bigtenant-ns": 1390, "other-ns": 10},
+                      "objects": {}, "ns_dropped": 0, "obj_dropped": 96,
+                      "oldest": "2026-06-01T00:23:11Z",
+                      "newest": "2026-10-14T18:12:01Z", "samples": []},
+    "KubeJobNotCompleted": {"count": 2, "severities": {"warning": 2},
+                            "namespaces": {"foldify-ns": 2},
+                            "objects": {"foldify-ns/etl-step": 2},
+                            "ns_dropped": 0, "obj_dropped": 0,
+                            "oldest": "2026-10-14T00:37:00Z",
+                            "newest": "2026-10-14T12:00:00Z", "samples": []},
+    "KubePersistentVolumeInodesFillingUp": {
+        "count": 4, "severities": {"critical": 4},
+        "namespaces": {"a-ns": 2, "b-ns": 2},
+        "objects": {"a-ns/pvc-db-backup": 2, "b-ns/pvc-db-backup": 2},
+        "ns_dropped": 0, "obj_dropped": 0,
+        "oldest": "2026-10-14T20:48:00Z", "newest": "2026-10-14T20:51:00Z",
+        "samples": []},
+    "CustomTotallyNewAlert": {"count": 5, "severities": {"info": 5},
+                              "namespaces": {}, "objects": {},
+                              "ns_dropped": 0, "obj_dropped": 0,
+                              "oldest": "2026-10-14T09:00:00Z",
+                              "newest": "2026-10-14T09:05:00Z",
+                              "samples": [{"target": "x"}]},
+}}}
+_gb2, _ = _prom_bundle(_grp)
+_af = {f["code"]: f for f in _np.r_prom_alerts(_gb2)}
+check("jobs aggregate into one finding", "PROM_ALERTS_JOBS" in _af, sorted(_af))
+check("a dominant namespace is named in the title",
+      "bigtenant-ns" in _af.get("PROM_ALERTS_JOBS", {}).get("title", ""),
+      _af.get("PROM_ALERTS_JOBS", {}).get("title"))
+check("the per-rule counts survive the fold",
+      any("1400" in d and "KubeJobFailed" in d
+          for d in _af.get("PROM_ALERTS_JOBS", {}).get("detail", [])),
+      _af.get("PROM_ALERTS_JOBS", {}).get("detail"))
+check("a weeks-old alert group is called out",
+      any("continuously" in d for d in _af.get("PROM_ALERTS_JOBS", {}).get("detail", [])),
+      _af.get("PROM_ALERTS_JOBS", {}).get("detail"))
+check("a capped object histogram says what was dropped",
+      any("aggregation cap" in d for d in _af.get("PROM_ALERTS_JOBS", {}).get("detail", [])),
+      _af.get("PROM_ALERTS_JOBS", {}).get("detail"))
+check("storage is its own category and stays critical",
+      _af.get("PROM_ALERTS_STORAGE", {}).get("severity") == "crit",
+      _af.get("PROM_ALERTS_STORAGE", {}))
+check("storage lists the PVCs, not 4 near-identical lines",
+      any("pvc-db-backup" in d for d in _af.get("PROM_ALERTS_STORAGE", {}).get("detail", [])),
+      _af.get("PROM_ALERTS_STORAGE", {}).get("detail"))
+check("an unknown alert name is listed, never folded silent",
+      _af.get("PROM_ALERTS_OTHER", {}).get("severity") == "info" and
+      "CustomTotallyNewAlert" in _af.get("PROM_ALERTS_OTHER", {}).get("title", ""),
+      _af.get("PROM_ALERTS_OTHER", {}))
 
 # a wholly-down job is a config problem, not N outages
 _gap = {

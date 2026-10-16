@@ -2052,6 +2052,42 @@ def p_httproutes(o, F, src):
     F.add("k8s.httproute.orphaned", orphaned, src)
 
 
+# CNPG declares exactly one healthy phase; everything else ("Setting up
+# primary", "Failing over", "Waiting for user action", ...) is a condition a
+# human should see named. A cluster with NO status at all is not flagged: the
+# operator has not reconciled it yet, and a missing fact is absent, not bad.
+_CNPG_HEALTHY_PHASE = "Cluster in healthy state"
+
+
+def p_cnpg_clusters(o, F, src):
+    items, unhealthy = [], []
+    for c in _items(o):
+        nn = _nn(c)
+        items.append(nn)
+        spec = c.get("spec") or {}
+        st = c.get("status") or {}
+        want = spec.get("instances")
+        ready = st.get("readyInstances")
+        phase = st.get("phase")
+        issues = []
+        if phase and phase != _CNPG_HEALTHY_PHASE:
+            issues.append("phase: %s" % phase)
+        for cond in st.get("conditions") or []:
+            if cond.get("type") == "Ready" and cond.get("status") != "True":
+                issues.append("Ready=%s (%s)"
+                              % (cond.get("status") or "?",
+                                 cond.get("reason") or "?"))
+        if isinstance(want, int) and isinstance(ready, int) \
+                and ready < want:
+            issues.append("%d of %d instances ready" % (ready, want))
+        if issues:
+            unhealthy.append({"nn": nn, "phase": phase, "ready": ready,
+                              "instances": want, "issues": issues})
+    F.add("k8s.cnpg.count", len(items), src)
+    F.add("k8s.cnpg.items", sorted(items), src)
+    F.add("k8s.cnpg.unhealthy", unhealthy, src)
+
+
 PARSERS = {
     "k_version": p_version,
     "k_readyz": p_readyz,
@@ -2096,6 +2132,7 @@ PARSERS = {
     "k_resourceslices": p_resourceslices,
     "k_gateways": p_gateways,
     "k_httproutes": p_httproutes,
+    "k_cnpg_clusters": p_cnpg_clusters,
     "k_top_cpu": p_usage,
     "k_top_gpu": p_usage,
     "k_log_thanos_sidecar": p_log_check,

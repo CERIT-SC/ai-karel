@@ -1453,6 +1453,46 @@ def r_gateway(bundle):
     return out
 
 
+def r_cnpg(bundle):
+    """CloudNativePG: per-cluster health from the operator's own status.
+    The CRD may be absent (a quiet cannot-see note, like the Gateway CRDs);
+    a cluster with no ready instances is a database down (CRIT), anything
+    else degraded is WARN; a healthy fleet prints its one line so the check
+    is visibly done."""
+    cmds = bundle["collection"]["commands"]
+    count = _f(bundle, "k8s.cnpg.count")
+    c = cmds.get("k_cnpg_clusters")
+    if count is None and c and c.get("status") in ("failed", "eacces") \
+            and c.get("expected") != "ok":
+        return [_finding(
+            "KAREL_CNPG_CRD_ABSENT", "info",
+            "CloudNativePG CRDs are not installed (or not readable) here",
+            detail=["the CNPG cluster checks were skipped"],
+            evidence=["k_cnpg_clusters"])]
+    if count is None:
+        return []
+
+    out = []
+    unhealthy = _f(bundle, "k8s.cnpg.unhealthy", []) or []
+    for u in unhealthy:
+        down = u.get("ready") == 0 and (u.get("instances") or 0) > 0
+        ns, _, name = u["nn"].partition("/")
+        out.append(_finding(
+            "K8S_CNPG_CLUSTER_UNHEALTHY", "crit" if down else "warn",
+            "CNPG cluster %s: %s" % (u["nn"], "; ".join(u["issues"])),
+            subject=u["nn"], detail=u["issues"],
+            evidence=["k_cnpg_clusters"],
+            remediation=["`kubectl -n %s describe cluster.postgresql.cnpg.io "
+                         "%s` - the operator names the blocker on the "
+                         "cluster's conditions" % (ns, name)]))
+    if not unhealthy:
+        out.append(_finding(
+            "K8S_CNPG_HEALTHY", "info",
+            "%d CNPG clusters, all healthy" % count,
+            evidence=["k_cnpg_clusters"]))
+    return out
+
+
 def r_failure_patterns(bundle):
     """Deterministic root-cause groupings the AI layer names. The same image
     repo failing to pull across many namespaces is ONE announcement; floating
@@ -1644,6 +1684,7 @@ RULES = [
     r_acme,
     r_resource_waste,
     r_gateway,
+    r_cnpg,
     r_failure_patterns,
     r_jupyterhub_cleanup,
 ]

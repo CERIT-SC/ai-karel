@@ -94,6 +94,10 @@ of things that actually need a human today — and make it impossible to mistake
   marks `k_clusterpolicy` `expected_status: eacces`, so a denied or missing
   CRD is not a fault. If you want the GPU-operator rollcall, add a
   ClusterRole rule for it and remove the `expected_status`.
+* The CNPG `clusters.postgresql.cnpg.io` and Gateway API CRDs likewise carry
+  `expected_status: eacces`: on a cluster without those operators the check
+  is a *cannot see* note, not a fault. `view` usually covers both where they
+  are installed.
 * ConfigMap `get`/`create`/`update` in `KAREL_NS` for state, suppressions and
   the housekeeping age tracking.
 
@@ -154,6 +158,7 @@ python3 tests/test_housekeeping.py  # exclusions, state, keep annotation, csv, a
 python3 tests/test_acme.py          # ACME solver + certificate checks
 python3 tests/test_usage.py         # waste wrapper + parse rules + section
 python3 tests/test_gateway.py       # Gateway API checks
+python3 tests/test_cnpg.py          # CloudNativePG cluster health checks
 python3 tests/test_failed_recent.py # recent Failed pods tenant row
 python3 tests/test_ai_contract.py   # external slots, failing pods, validator
 python3 tests/fuzz.py               # rule invariants under mutated bundles
@@ -501,6 +506,20 @@ reason; HTTPRoute `Accepted`/`ResolvedRefs=False` parents land in the tenant
 table; a route attached to no parent goes to housekeeping
 (`gateway_orphaned_route`). A fully healthy plane prints its one line:
 `8 Gateways, 45 HTTPRoutes, all accepted`.
+
+## CloudNativePG (CNPG)
+
+`k_cnpg_clusters` reads the operator's own `clusters.postgresql.cnpg.io`
+status (carries `expected_status: eacces`, so a missing or unreadable CRD is
+a *cannot see* note, not a fault). A cluster is unhealthy when its phase is
+anything but `Cluster in healthy state` ("Failing over", "Waiting for user
+action", ...), when its `Ready` condition is not True, or when fewer
+instances are ready than `spec.instances` asks for - each becomes a
+`K8S_CNPG_CLUSTER_UNHEALTHY` finding naming phase, condition reason and the
+ready count. CRIT when 0 of N instances are ready (the database is down),
+WARN otherwise. A cluster the operator has not reconciled yet (no status at
+all) is unknown, never blamed. A fully healthy fleet prints its one line:
+`3 CNPG clusters, all healthy`.
 
 ## GPU driver upgrade state
 

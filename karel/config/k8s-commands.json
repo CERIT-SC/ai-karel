@@ -42,6 +42,7 @@
     { "name": "k_resourceslices", "argv": ["kubectl","get","resourceslices.resource.k8s.io","-A","-o","json"],    "tier": 2, "timeout": 45, "expected_status": "eacces" },
     { "name": "k_gateways",       "argv": ["kubectl","get","gateways.gateway.networking.k8s.io","-A","-o","json"], "tier": 2, "timeout": 45, "expected_status": "eacces" },
     { "name": "k_httproutes",     "argv": ["kubectl","get","httproutes.gateway.networking.k8s.io","-A","-o","json"], "tier": 2, "timeout": 45, "expected_status": "eacces" },
+    { "name": "k_cnpg_clusters",  "argv": ["kubectl","get","clusters.postgresql.cnpg.io","-A","-o","json"],       "tier": 2, "timeout": 30, "expected_status": "eacces" },
     { "name": "k_log_thanos_sidecar",   "argv": ["python3","${KAREL_HOME}/bin/collect_logs.py","--check","thanos_sidecar"],   "tier": 2, "timeout": 60 },
     { "name": "k_log_thanos_compactor", "argv": ["python3","${KAREL_HOME}/bin/collect_logs.py","--check","thanos_compactor"], "tier": 2, "timeout": 60 },
     { "name": "k_log_thanos_querier",   "argv": ["python3","${KAREL_HOME}/bin/collect_logs.py","--check","thanos_querier"],   "tier": 2, "timeout": 60 },

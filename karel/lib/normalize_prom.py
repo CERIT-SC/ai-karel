@@ -6,6 +6,7 @@ number came from a point-in-time collector or from a time series. That matters
 because they answer different questions and fail in different ways.
 """
 
+import datetime as _datetime
 import json
 import os
 
@@ -132,6 +133,9 @@ def ingest(out_dir, F, collection):
              "target": a.get("instance") or a.get("namespace"),
              "since": a.get("startsAt"), "summary": a.get("summary")}
             for a in items[:30]], "prom")
+        groups = alerts.get("groups")
+        if groups:
+            F.add("prom.alerts_groups", groups, "prom")
 
     targets = doc.get("targets") or {}
     if targets.get("available"):
@@ -382,21 +386,205 @@ def r_scrape_gap_consequences(bundle):
     return out
 
 
+# Alerts already categorised away on purpose: Watchdog fires permanently by
+# design (it certifies the pipeline works), InfoInhibitor is inhibition
+# plumbing - it fires BECAUSE another alert is being suppressed. Reporting
+# either as a finding is exactly the noise this tool is supposed to reduce.
+_ALERTS_BY_DESIGN = {"watchdog", "alwaysfiring", "deadmansswitch",
+                     "infoinhibitor"}
+
+
+def _norm_name(s):
+    return str(s or "").lower().replace("-", "").replace("_", "")
+
+
+# Categorisation of the kube-prometheus/rancher default ruleset, in match
+# order (first prefix hit wins). A name this table does not know lands in
+# "other" and is listed explicitly - nothing new folds silent into an
+# aggregate.
+_ALERT_CATEGORIES = [
+    ("control_plane", "PROM_ALERTS_CONTROL_PLANE", "control plane",
+     ("kubeapi", "etcd", "kubescheduler", "kubecontrollermanager",
+      "kubeclienterrors", "kubeversionmismatch"),
+     "control-plane alerts are never tenant noise",
+     ["a firing control-plane rule means the cluster itself is degraded - "
+      "handle these before anything else in this report"]),
+    ("storage", "PROM_ALERTS_STORAGE", "volume fullness",
+     ("kubepersistentvolume", "kubeletvolumespace", "ceph"),
+     "PV fullness comes in two shapes: bytes (FillingUp) and inodes "
+     "(InodesFillingUp - too many small files; deleting big files does not help)",
+     ["inodes: find the writer of many small files on that PVC and reduce "
+      "file count or raise fsGroup-friendly storage",
+      "a critical PV alert is data unwritable-waiting-to-happen"]),
+    ("nodes", "PROM_ALERTS_NODES", "nodes",
+     ("node", "kubelet"),
+     "node-level resource pressure the scheduler cannot fix by itself",
+     ["the node table in this report shows the same nodes' conditions, "
+      "kernels and versions"]),
+    ("jobs", "PROM_ALERTS_JOBS", "jobs",
+     ("kubejob",),
+     "one alert per failed or stalled Job object - the fix is per Job, "
+     "not per alert",
+     ["kubectl -n <ns> get jobs - the backlog is usually one launcher or "
+      "CronJob looping; stop it, then clear the failed Jobs it left",
+      "ttlSecondsAfterFinished on Jobs keeps the backlog from re-accumulating"]),
+    ("workloads", "PROM_ALERTS_WORKLOADS", "workloads",
+     ("kubedeployment", "kubestatefulset", "kubedaemonset", "kubepod",
+      "kubecontainer", "kubereplicaset"),
+     "pods and controllers out of shape - the alert engine sees these "
+     "continuously, Karel's own workload sections see the daily snapshot",
+     ["the failing-pods and workload findings in this report name the owners "
+      "behind the same symptoms"]),
+    ("capacity", "PROM_ALERTS_CAPACITY", "quota and sizing",
+     ("kubequota", "kubecpuquota", "kubememoryquota", "kubehpa",
+      "cputhrottling", "kubepdb"),
+     "sizing, not faults: quota hardens into refused creates, throttling "
+     "into latency",
+     ["a quota alert firing for weeks means the namespace needs a quota "
+      "decision, not another notification"]),
+    ("monitoring", "PROM_ALERTS_MONITORING", "monitoring",
+     ("targetdown", "prometheus", "alertmanager", "thanos", "grafana"),
+     "alerts about the monitoring stack itself; a down scrape target here is "
+     "Alertmanager's continuous view of the blind spot the scrape-target "
+     "findings above detect structurally",
+     ["if a component was deliberately disabled, remove its ServiceMonitor "
+      "rather than living with the alert"]),
+]
+
+
+def _alert_category(name):
+    n = _norm_name(name)
+    for key, _code, _label, prefixes, _note, _rem in _ALERT_CATEGORIES:
+        if any(n.startswith(p) for p in prefixes):
+            return key
+    return "other"
+
+
+def _groups_from_flat(flat, total):
+    """Old collectors (and replayed bundles) carry only a bounded flat sample
+    - build the same grouped shape with the sample flags set."""
+    groups = {}
+    for a in flat:
+        g = groups.setdefault(a.get("name") or "?", {
+            "count": 0, "severities": {}, "namespaces": {}, "objects": {},
+            "ns_dropped": 0, "obj_dropped": 0,
+            "oldest": None, "newest": None, "samples": [], "sampled": True})
+        g["count"] += 1
+        sev = (a.get("severity") or "unknown").lower()
+        g["severities"][sev] = g["severities"].get(sev, 0) + 1
+        s = a.get("since")
+        if s:
+            g["oldest"] = min(g["oldest"], s) if g["oldest"] else s
+            g["newest"] = max(g["newest"], s) if g["newest"] else s
+        if len(g["samples"]) < 3:
+            g["samples"].append(a)
+    return groups
+
+
+def _group_line(name, g):
+    parts = ["%s: %d alert(s)" % (name, g.get("count") or 0)]
+    sevs = g.get("severities") or {}
+    if len(sevs) > 1:
+        parts.append("severity %s" % "/".join(
+            "%s x%d" % (s, sevs[s]) for s in sorted(sevs)))
+    nss = g.get("namespaces") or {}
+    if nss:
+        top = sorted(nss.items(), key=lambda kv: (-kv[1], kv[0]))
+        if len(top) == 1 and not g.get("ns_dropped"):
+            parts.append("in %s" % top[0][0])
+        else:
+            head = ", ".join("%s x%d" % (ns, c) for ns, c in top[:3])
+            tail = ", ..." if len(top) > 3 or g.get("ns_dropped") else ""
+            parts.append("across %d namespaces (%s%s)"
+                         % (len(top) + (g.get("ns_dropped") or 0), head, tail))
+    objs = g.get("objects") or {}
+    if objs and len(objs) <= 5 and not g.get("obj_dropped"):
+        parts.append("objects: %s" % ", ".join(sorted(objs)))
+    elif g.get("obj_dropped"):
+        parts.append("plus %d further distinct objects beyond the aggregation "
+                     "cap" % g["obj_dropped"])
+    elif not nss and (g.get("count") or 0) <= 5 and g.get("samples"):
+        tgts = sorted({str(s.get("instance") or s.get("namespace")
+                          or s.get("target")) for s in g["samples"]
+                       if s.get("instance") or s.get("namespace")
+                       or s.get("target")})
+        if tgts:
+            parts.append("targets: %s" % ", ".join(tgts))
+    if g.get("oldest"):
+        parts.append("oldest %s" % str(g["oldest"])[:16])
+    return "; ".join(parts)
+
+
+def _stale_days(oldest):
+    try:
+        dt = _datetime.datetime.strptime(str(oldest)[:19], "%Y-%m-%dT%H:%M:%S")
+        return (_datetime.datetime.utcnow() - dt).days
+    except Exception:
+        return None
+
+
+def _alerts_severity(groups, names):
+    sevs = set()
+    for n in names:
+        sevs.update((groups[n].get("severities") or {}))
+    if "critical" in sevs:
+        return "crit"
+    if "warning" in sevs:
+        return "warn"
+    return "info"
+
+
+def _category_finding(code, label, note, remediation, groups, names):
+    total = sum(groups[n].get("count") or 0 for n in names)
+    ns_all = {}
+    for n in names:
+        for k, v in (groups[n].get("namespaces") or {}).items():
+            ns_all[k] = ns_all.get(k, 0) + v
+    dominance = ""
+    if ns_all:
+        top_ns, top_n = max(ns_all.items(), key=lambda kv: kv[1])
+        if total >= 10 and top_n >= 0.75 * total:
+            dominance = " - mostly %s" % top_ns
+
+    detail = [_group_line(n, groups[n]) for n in names] + [note]
+
+    olds = [groups[n].get("oldest") for n in names if groups[n].get("oldest")]
+    if olds:
+        age = _stale_days(min(olds))
+        if age is not None and age >= 7:
+            detail.append(
+                "the oldest alert in this group has fired continuously for "
+                "%d days; an alert nobody acts on is either noise to tune or "
+                "a problem someone decided to live with - both need a decision"
+                % age)
+    return _finding(
+        code, _alerts_severity(groups, names),
+        "%d firing alert(s): %s%s" % (total, label, dominance),
+        detail=detail, evidence=["prom"], metric=float(total),
+        remediation=remediation)
+
+
 def r_prom_alerts(bundle):
     """Alertmanager already encodes what this organisation decided matters.
-    Re-deriving those judgements would be arrogant; ignoring them, worse."""
+    Re-deriving those judgements would be arrogant; ignoring them, worse.
+    But an alert fires per label-set, not per problem - one tenant's failing
+    CronJob is 1,400 KubeJobFailed line items, four inodes-full nodes is
+    1,600. They are therefore categorised by what they are about and
+    aggregated: one finding per domain, the dominant namespace named, the
+    per-rule counts inside."""
     out = []
     if not _f(bundle, "prom.alerts_available"):
         return out
-    alerts = _f(bundle, "prom.alerts", []) or []
-    # Watchdog fires permanently by design - it certifies that the alerting
-    # pipeline works. Reporting it as a finding is exactly the noise this tool
-    # is supposed to reduce.
-    BY_DESIGN = {"watchdog", "alwaysfiring", "deadmansswitch"}
-    alerts = [a for a in alerts
-              if (a.get("name") or "").lower().replace("-", "") not in BY_DESIGN]
-    if not alerts:
-        if _f(bundle, "prom.alerts_count"):
+    groups = _f(bundle, "prom.alerts_groups")
+    flat = _f(bundle, "prom.alerts", []) or []
+    total = _f(bundle, "prom.alerts_count")
+    sampled = groups is None
+    if sampled:
+        groups = _groups_from_flat(flat, total)
+    groups = {k: v for k, v in groups.items()
+              if _norm_name(k) not in _ALERTS_BY_DESIGN}
+    if not groups:
+        if total:
             out.append(_finding(
                 "PROM_NO_REAL_ALERTS", "info",
                 "Only the always-firing watchdog alert is active",
@@ -405,26 +593,39 @@ def r_prom_alerts(bundle):
                 evidence=["prom"]))
         return out
 
-    by_sev = {}
-    for a in alerts:
-        k = (a.get("severity") or "unknown").lower()
-        by_sev[k] = by_sev.get(k, 0) + 1
-    crit = [a for a in alerts if (a.get("severity") or "").lower() == "critical"]
-    sev = "crit" if crit else "warn"
-    out.append(_finding(
-        "PROM_ACTIVE_ALERTS", sev,
-        "%d Alertmanager alert(s) firing (%s)"
-        % (len(alerts),
-           ", ".join("%d %s" % (v, k) for k, v in sorted(by_sev.items()))),
-        detail=["[%s] %s — %s (since %s)"
-                % ((a.get("severity") or "?").upper(), a.get("name"),
-                   a.get("target") or "cluster", (a.get("since") or "?")[:16])
-                for a in alerts[:15]],
-        evidence=["prom"], metric=float(len(alerts)),
-        remediation=["these are your own alerting rules, not Karel's judgement",
-                     "an alert firing continuously for days is either a real "
-                     "unfixed problem or a rule nobody trusts - both need a "
-                     "decision"]))
+    cats = {}
+    for name in groups:
+        cats.setdefault(_alert_category(name), []).append(name)
+
+    first = True
+    for key, code, label, _pre, note, remediation in _ALERT_CATEGORIES:
+        names = sorted(cats.get(key) or (),
+                       key=lambda n: (-groups[n]["count"], n))
+        if not names:
+            continue
+        f = _category_finding(code, label, note, remediation, groups, names)
+        if first and sampled:
+            f["detail"].append(
+                "counts come from a %d-alert sample - the collector that wrote "
+                "this bundle predates grouped aggregation" % len(flat))
+        first = False
+        out.append(f)
+
+    names = sorted(cats.get("other") or (),
+                   key=lambda n: (-groups[n]["count"], n))
+    if names:
+        detail = [_group_line(n, groups[n]) for n in names] + [
+            "alert rule names Karel does not categorise - they are listed "
+            "individually so nothing new disappears into an aggregate"]
+        total = sum(groups[n].get("count") or 0 for n in names)
+        out.append(_finding(
+            "PROM_ALERTS_OTHER", _alerts_severity(groups, names),
+            "%d firing alert(s) of uncategorised rule(s): %s"
+            % (total, ", ".join(sorted(names))),
+            detail=detail, evidence=["prom"], metric=float(total),
+            remediation=["these are your own alerting rules, not Karel's "
+                         "judgement - check whether they are tuned to be "
+                         "actionable"]))
     return out
 
 

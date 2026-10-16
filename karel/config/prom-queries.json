@@ -162,11 +162,11 @@
     },
     {
       "name": "pod_oomkills_24h",
-      "expr": "sum by (namespace, pod) (increase(kube_pod_container_status_terminated_reason{reason=\"OOMKilled\"}[24h])) > 0",
+      "expr": "sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total[24h]) > 0 and on(namespace, pod, container) (kube_pod_container_status_last_terminated_reason{reason=\"OOMKilled\"} == 1))",
       "reduce": "labels:namespace,pod",
       "tier": 1,
       "timeout": 45,
-      "_why": "the single biggest thing the 1h event TTL hides",
+      "_why": "restarts whose last termination was OOMKilled; kube_pod_container_status_terminated_reason cannot do this - it is a gauge for the CURRENT terminated state whose series vanishes on restart, exactly when the kill becomes invisible, and increase() over it is 0 by construction",
       "window_days": 1,
       "empty_means": "none",
       "source_job": "kube-state-metrics"
@@ -193,13 +193,13 @@
     },
     {
       "name": "node_notready_minutes_24h",
-      "expr": "sum by (node) (sum_over_time((kube_node_status_condition{condition=\"Ready\",status=\"true\"} == 0)[24h:1m]))",
+      "expr": "sum by (node) (sum_over_time((1 - kube_node_status_condition{condition=\"Ready\",status=\"true\"})[24h:1m]))",
       "reduce": "by:node",
       "tier": 1,
       "timeout": 45,
-      "_why": "a node that flapped overnight and recovered",
+      "_why": "a node that flapped overnight and recovered; measured as per-node minutes with Ready!=true (a real zero per healthy node) instead of a filtered == 0, so all-Ready reports a 0 rather than vanishing into an ambiguous empty result",
       "window_days": 1,
-      "empty_means": "none",
+      "empty_means": "absent",
       "source_job": "kube-state-metrics"
     },
     {
