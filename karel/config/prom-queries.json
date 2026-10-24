@@ -150,6 +150,16 @@
       "source_job": "etcd"
     },
     {
+      "name": "node_timex_offset_max",
+      "expr": "max(abs(node_timex_offset_seconds))",
+      "reduce": "scalar",
+      "tier": 2,
+      "timeout": 30,
+      "_why": "the kernel's own clock-correction across nodes: a large offset means a clock being dragged - alert timelines, etcd and cert validity all assume aligned clocks",
+      "empty_means": "absent",
+      "source_job": "node-exporter"
+    },
+    {
       "name": "etcd_leader_changes_24h",
       "expr": "sum(increase(etcd_server_leader_changes_seen_total[24h]))",
       "reduce": "scalar",

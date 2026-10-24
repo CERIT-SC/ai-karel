@@ -194,6 +194,21 @@ print("\nbaseline bundles")
 
 for mode in ("healthy", "degraded"):
     bundle, _hs = build_bundle(mode)
+    # FIRST: prove collection happened. "No findings" is only news when an
+    # empty collection is excluded as the cause.
+    cmds = bundle["collection"]["commands"]
+    check("%s: collection actually ran (commands recorded, all ok)" % mode,
+          bool(cmds) and
+          all(c.get("status") == "ok" for c in cmds.values()),
+          sorted({(n, c.get("status")) for n, c in cmds.items()
+                  if c.get("status") != "ok"}))
+    check("%s: collection marked complete" % mode,
+          bool(bundle["collection"].get("complete")))
+    core_facts = [p for p in ("k8s.node.count", "k8s.pod.count",
+                              "k8s.ns.count")
+                  if bundle["facts"].get(p) is not None]
+    check("%s: core facts present (%d/3)" % (mode, len(core_facts)),
+          len(core_facts) == 3, sorted(core_facts))
     fs = evaluate_all(clone(bundle))
     check_findings(fs, bundle, mode)
     check_determinism(bundle, mode)

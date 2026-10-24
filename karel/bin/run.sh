@@ -38,6 +38,13 @@ if [ -z "${K8S_MANIFEST:-}" ]; then
   [ -f "$K8S_MANIFEST" ] || K8S_MANIFEST="$KAREL_HOME/config/k8s-commands.json"
 fi
 if [ -f "$K8S_MANIFEST" ]; then
+  if ! command -v jq >/dev/null 2>&1; then
+    # jq is what turns the manifest into plan-*.tsv. Without it the jq call
+    # below fails silently behind 2>/dev/null, the plan is EMPTY, and the
+    # report reads "nothing collected" instead of "Karel is broken".
+    log "FATAL: jq not found in PATH - cannot build the collection plan"
+    exit 1
+  fi
   jq -r --arg home "$KAREL_HOME" '
     .commands[]
     | [ .name, (.timeout // 30 | tostring), (.tier // 2 | tostring),

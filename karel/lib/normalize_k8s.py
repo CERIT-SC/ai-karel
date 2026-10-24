@@ -1673,6 +1673,7 @@ def p_usage(o, F, src):
     F.add(b + ".total_pods", len(rows), src)
     F.add(b + ".excluded_young", len(young), src)
     F.add(b + ".no_series", len(no_series), src)
+    F.add(b + ".wasting_pods", len(waste_rows), src)
     F.add(b + ".waste_total", round(waste_total, 3), src)
     top = [[r["nn"], r["req"], ("n/a" if r["use"] is None else r["use"]),
             round(w, 3),
@@ -1684,11 +1685,15 @@ def p_usage(o, F, src):
             # Missing series is first, then Scavenger rows. The latter can be
             # busy while sharing someone else's card, so usage-order alone can
             # drop them from a 30-row table even though they are allocations
-            # the operator asked to see.
+            # the operator asked to see. Among measured pods the ranking is
+            # use PER requested card: a pod holding 8 cards at 5% is more
+            # idle than one holding 1 card at 5%, and absolute cards would
+            # have claimed the opposite.
             priority = 0 if r["use"] is None else (1 if r.get("gpu_mem") else 2)
-            return (priority,
-                    r["use"] if r["use"] is not None else 0,
-                    -(r["age_h"] or 0))
+            use, req = r["use"], r["req"]
+            frac = (use / req) if (use is not None and req) else \
+                (0.0 if use is None else 1.0)
+            return (priority, frac, -(r["age_h"] or 0))
         gpu_top = sorted(ranked, key=key)[:limit]
         F.add(b + ".top_gpu", [
             [r["nn"], (r["use_raw"] or "n/a"),
@@ -2002,10 +2007,19 @@ def p_acme_challenges(o, F, src):
     F.add("k8s.acme.challenges_count", len(out), src)
 
 
+# Expired cert-manager Certificates. One mixed list used to be one CRIT:
+# a cert that expired yesterday is an outage in progress, a cert that
+# expired a YEAR ago is abandoned plumbing. The boundary lives here in the
+# parser so the rule and housekeeping read the same split.
+ACME_CERT_STALE_DAYS = 30
+
+
 def p_acme_certificates(o, F, src):
-    expired, expiring, not_ready = [], [], []
+    expired = []
+    expiring, not_ready = [], []
     for c in _items(o):
         st = c.get("status") or {}
+        md = c.get("metadata") or {}
         nn = _nn(c)
         not_after = st.get("notAfter")
         days = (_age_days_future(not_after)
@@ -2015,15 +2029,28 @@ def p_acme_certificates(o, F, src):
             if cond.get("type") == "Ready":
                 ready = cond.get("status") == "True"
         if days is not None and days <= 0:
-            expired.append("%s (expired %.0f days ago)"
-                           % (nn, -days))
+            expired.append({
+                "nn": nn, "days": -days,
+                "ns": md.get("namespace"), "name": md.get("name"),
+                "uid": md.get("uid"), "keep": _keep(md)})
         elif days is not None and days <= 7 and ready is False:
-            expiring.append("%s (%.0f days left, not Ready)"
-                            % (nn, days))
+            expiring.append("%s (%.0f days left, not Ready)" % (nn, days))
         if ready is False:
             not_ready.append(nn)
+    # newest first: the most recent expiry is the likeliest live outage
+    expired.sort(key=lambda e: e["days"])
+    recent = [e for e in expired if e["days"] <= ACME_CERT_STALE_DAYS]
+    stale = [e for e in expired if e["days"] > ACME_CERT_STALE_DAYS]
     F.add("k8s.acme.certificates_count", len(_items(o)), src)
-    F.add("k8s.acme.certificates_expired", sorted(expired), src)
+    F.add("k8s.acme.certificates_expired",
+          ["%s (expired %.0f days ago)" % (e["nn"], e["days"])
+           for e in expired], src)
+    F.add("k8s.acme.certificates_expired_recent",
+          ["%s (expired %.0f days ago)" % (e["nn"], e["days"])
+           for e in recent], src)
+    F.add("k8s.acme.certificates_expired_stale", stale[:60], src)
+    F.add("k8s.acme.certificates_expired_stale_count", len(stale), src)
+    F.add("k8s.acme.certificates_expired_stale_days", ACME_CERT_STALE_DAYS, src)
     F.add("k8s.acme.certificates_expiring_not_ready", sorted(expiring), src)
     F.add("k8s.acme.certificates_not_ready", sorted(not_ready)[:40], src)
 

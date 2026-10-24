@@ -42,6 +42,7 @@ CATEGORIES = {
     "ns_stuck_terminating":     ("certain", 0),
     "pod_stuck_terminating":    ("certain", 0),
     "acme_solver_stale":        ("certain", 0),
+    "acme_cert_expired":        ("likely", 7),
     "gateway_orphaned_route":   ("likely", 7),
     "demo_workload":            ("likely", 30),
 }
@@ -121,6 +122,7 @@ CAT_SOURCE = {
     "ns_stuck_terminating": "k_namespaces",
     "pod_stuck_terminating": "k_pods",
     "acme_solver_stale": "k_acme_solvers",
+    "acme_cert_expired": "k_acme_certificates",
     "gateway_orphaned_route": "k_httproutes",
     "demo_workload": "k_deployments",
     "gpu_upgrade_blocked": "k_nodes",
@@ -437,6 +439,26 @@ def _acme_solver_items(bundle, now, items, stats):
         })
 
 
+def _acme_cert_items(bundle, now, items, stats):
+    """Certificates expired longer than the parser's stale boundary: nobody
+    renewed them for weeks, so they are abandoned plumbing, not outages -
+    the recent ones stay with r_acme as CRIT."""
+    stale = _f(bundle, "k8s.acme.certificates_expired_stale")
+    if stale is None:
+        return
+    for e in stale:
+        items.append({
+            "ns": e.get("ns"), "kind": "Certificate",
+            "name": e.get("name"),
+            "uid": e.get("uid"),
+            "category": "acme_cert_expired",
+            "reason": "certificate expired %.0f days ago and was never "
+                      "renewed" % (e.get("days") or 0),
+            "cost": "", "cost_gb": 0.0, "created": None,
+            "keep_reason": e.get("keep"),
+        })
+
+
 def _gateway_items(bundle, now, items, stats):
     orphaned = _f(bundle, "k8s.httproute.orphaned")
     if orphaned is None:
@@ -481,6 +503,7 @@ def derive(bundle, prev_state=None, now=None, prev_facts=None):
     _namespace_items(bundle, now, items, stats)
     _terminating_pod_items(bundle, now, items, stats)
     _acme_solver_items(bundle, now, items, stats)
+    _acme_cert_items(bundle, now, items, stats)
     _gateway_items(bundle, now, items, stats)
     _demo_items(bundle, now, items, stats)
 

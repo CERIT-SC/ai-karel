@@ -36,6 +36,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime as _dt
 
 PROM_URL = os.environ.get(
     "PROM_URL",
@@ -166,6 +167,18 @@ _GROUP_OBJECT_LABELS = ("persistentvolumeclaim", "job_name", "resourcequota",
 _GROUP_CAP = 100  # per histogram; the drop is recorded, never silent
 
 
+def _alert_target(labels):
+    """Best human-readable target for an alert sample: the object's own
+    labels first (persistentvolumeclaim with its namespace), then the raw
+    instance address, then the pod."""
+    if labels.get("persistentvolumeclaim"):
+        return "%s/%s" % (labels.get("namespace") or "",
+                          labels["persistentvolumeclaim"])
+    if labels.get("namespace") and not labels.get("instance"):
+        return labels["namespace"]
+    return labels.get("instance") or labels.get("pod")
+
+
 def _hist_add(hist, key):
     """key -> hist[key] += 1, capped. Returns 1 when the add was dropped."""
     if key in hist or len(hist) < _GROUP_CAP:
@@ -202,7 +215,10 @@ def fetch_alerts():
                 "name": labels.get("alertname"),
                 "severity": labels.get("severity"),
                 "namespace": labels.get("namespace"),
-                "instance": labels.get("instance") or labels.get("pod"),
+                # object-identifying labels name the thing a human looks
+                # at; the instance label names the SCRAPE SOURCE, which for
+                # aggregated alerts (pvc, quota) is plumbing, not the object
+                "instance": _alert_target(labels),
                 "summary": (ann.get("summary") or ann.get("description") or "")[:200],
                 "startsAt": a.get("startsAt"),
             }
@@ -231,8 +247,25 @@ def fetch_alerts():
                     g["newest"] = starts
             if len(g["samples"]) < 3:
                 g["samples"].append(entry)
-        return {"available": True, "count": len(out), "alerts": out[:60],
-                "groups": groups}
+        # The newest alert start time vs OUR clock: if Alertmanager stamps
+        # alerts minutes in the future or hours in the past, every 'oldest /
+        # newest' line in the report is silently wrong, and that is exactly
+        # the sort of lie this tool exists to prevent.
+        newest = None
+        for a in items or []:
+            s = a.get("startsAt")
+            if s and (newest is None or s > newest):
+                newest = s
+        payload = {"available": True, "count": len(out), "alerts": out[:60],
+                   "groups": groups}
+        if newest:
+            try:
+                skew = _dt.fromisoformat(
+                    newest.replace("Z", "+00:00")).timestamp() - time.time()
+                payload["clock_skew_seconds"] = round(skew)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return payload
     return {"available": False, "error": last}
 
 

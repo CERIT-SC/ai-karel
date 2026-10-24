@@ -937,14 +937,23 @@ def _netpol_blocks(ns, netpols, ingress_ns):
 
 def r_acme(bundle):
     out = []
-    certs_expired = _f(bundle, "k8s.acme.certificates_expired") or []
+    certs_recent = _f(bundle, "k8s.acme.certificates_expired_recent")
+    if certs_recent is None:
+        # bundle from before the split: treat every expired cert as recent,
+        # the old behaviour - better one noisy CRIT than hiding an outage
+        certs_recent = _f(bundle, "k8s.acme.certificates_expired") or []
     certs_expiring = _f(bundle, "k8s.acme.certificates_expiring_not_ready") or []
-    if certs_expired or certs_expiring:
+    stale_n = _f(bundle, "k8s.acme.certificates_expired_stale_count") or 0
+    stale_days = _f(bundle, "k8s.acme.certificates_expired_stale_days") or 30
+    if certs_recent or certs_expiring:
         out.append(_finding(
             "ACME_CERT_EXPIRING", "crit",
             "%d certificate(s) expired, %d expiring inside 7 days and not "
-            "Ready" % (len(certs_expired), len(certs_expiring)),
-            detail=sorted(certs_expired + certs_expiring)[:15] +
+            "Ready" % (len(certs_recent), len(certs_expiring)),
+            detail=sorted(certs_recent + certs_expiring)[:15] +
+                   (["%d more certificate(s) expired over %d days ago - those "
+                     "are abandoned, listed under housekeeping, not here"
+                     % (stale_n, stale_days)] if stale_n else []) +
                    ["this is the impact signal - the solvers below are only "
                     "the cause"],
             evidence=["k_acme_certificates"],
@@ -1330,15 +1339,21 @@ def r_resource_waste(bundle):
         top = _f(bundle, "k8s.usage.cpu.top", []) or []
         waste = _f(bundle, "k8s.usage.cpu.waste_total") or 0
         young = _f(bundle, "k8s.usage.cpu.excluded_young") or 0
-        sections.append(("CPU", "%d pods measured, %.1f cores wasted total"
-                         % (cpu_total, waste), top, young))
+        wpods = _f(bundle, "k8s.usage.cpu.wasting_pods")
+        sections.append(("CPU", "%s, %.1f cores wasted combined"
+                         % (("%d pods wasting" % wpods) if wpods is not None
+                            else "%d pods measured" % cpu_total, waste),
+                         top, young))
     if gpu_total is not None:
         topg = _f(bundle, "k8s.usage.gpu.top_gpu", []) or []
         young = _f(bundle, "k8s.usage.gpu.excluded_young") or 0
         ns_n = _f(bundle, "k8s.usage.gpu.no_series") or 0
         waste = _f(bundle, "k8s.usage.gpu.waste_total") or 0
-        sections.append(("GPU", "%d pods, %.0f cards wasted, %d with no "
-                         "usage series at all" % (gpu_total, waste, ns_n),
+        wpods = _f(bundle, "k8s.usage.gpu.wasting_pods")
+        sections.append(("GPU", "%s, %.0f cards wasted, %d with no "
+                         "usage series at all"
+                         % (("%d pods wasting" % wpods) if wpods is not None
+                            else "%d pods" % gpu_total, waste, ns_n),
                          topg, young))
     if not sections:
         return out

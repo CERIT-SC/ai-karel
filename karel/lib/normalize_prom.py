@@ -136,6 +136,9 @@ def ingest(out_dir, F, collection):
         groups = alerts.get("groups")
         if groups:
             F.add("prom.alerts_groups", groups, "prom")
+        if alerts.get("clock_skew_seconds") is not None:
+            F.add("prom.alerts_clock_skew_seconds",
+                  alerts["clock_skew_seconds"], "prom")
 
     targets = doc.get("targets") or {}
     if targets.get("available"):
@@ -160,6 +163,8 @@ PROM_THRESHOLDS = {
     "pvc_nfs_warn": 95.0,
     "pvc_nfs_crit": 97.0,
     "etcd_quota_crit_pct": 85.0,
+    "alertmgr_clock_skew_warn_s": 300,
+    "node_timex_warn_s": 0.5,
     "min_retention_days_for_trend": 7.0,
 }
 
@@ -990,6 +995,42 @@ def _next_month_compaction(collected_at):
 
 
 
+def r_prom_clock(bundle):
+    """Wall-clock truth. Everything in this report - alert ages, forecast
+    windows, cert expiry - assumes all clocks agree. Two independent
+    measurements: Alertmanager's own timestamps vs Karel's clock, and the
+    kernel's correction on the worst node."""
+    out = []
+    skew = _f(bundle, "prom.alerts_clock_skew_seconds")
+    if skew is not None and abs(skew) >= PROM_THRESHOLDS["alertmgr_clock_skew_warn_s"]:
+        detail = [
+            "alert start times differ from this report's clock by %+.0f s - "
+            "every alert age above is that much wrong" % skew,
+            "check NTP (chronyc tracking) on the Alertmanager host and on "
+            "Karel's node"]
+        timex = _f(bundle, "prom.node_timex_offset_max")
+        if timex is not None:
+            detail.append("max node_timex_offset_seconds: %.3f s" % timex)
+        out.append(_finding(
+            "K8S_ALERTMGR_CLOCK_SKEW", "warn",
+            "Alertmanager clock differs from Karel's by %+.0f s" % skew,
+            detail=detail, evidence=["prom"], metric=float(abs(skew)),
+            remediation=["check NTP on both hosts"]))
+    timex = _f(bundle, "prom.node_timex_offset_max")
+    if timex is not None and timex >= PROM_THRESHOLDS["node_timex_warn_s"]:
+        out.append(_finding(
+            "K8S_NODE_CLOCK_SKEW", "warn",
+            "a node's clock offset reached %.3f s" % timex,
+            detail=["node_timex_offset_seconds is the kernel's own "
+                    "correction: a large value means the clock is being "
+                    "dragged, whether or not NTP claims sync",
+                    "etcd, certificate validity, and this report's time "
+                    "windows all assume aligned clocks"],
+            evidence=["prom:node_timex_offset_max"], metric=float(timex),
+            remediation=["chronyc sources -v on the worst node"]))
+    return out
+
+
 RULES = [
     r_prom_health,
     r_scrape_gap_consequences,
@@ -997,5 +1038,6 @@ RULES = [
     r_prom_transients,
     r_prom_rates,
     r_prom_peaks,
+    r_prom_clock,
     r_prom_forecasts,
 ]

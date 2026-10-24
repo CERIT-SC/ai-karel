@@ -515,8 +515,6 @@ check("cron period: weekdays (Fri -> Mon gap)",
 check("cron period: macro", normalize_k8s.cron_period_days("@weekly") == 7.0)
 check("cron period: unparseable is None", normalize_k8s.cron_period_days("bad") is None)
 
-import datetime as _dt  # noqa: E402
-
 
 def _ago(days):
     return (_dt.datetime.utcnow() - _dt.timedelta(days=days)).strftime(
