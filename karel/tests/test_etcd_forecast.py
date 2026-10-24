@@ -15,12 +15,13 @@ GIB = 1024 ** 3
 
 
 def bundle(now_gib, pred_gib=None, ts="2026-10-24T09:00:00Z"):
-    b = facts({
-        "prom.etcd_db_size_now": now_gib * GIB,
-        "prom.etcd_db_predict_30d": (pred_gib * GIB) if pred_gib else None,
-    })
-    if pred_gib is None:
-        b["facts"].pop("prom.etcd_db_predict_30d")
+    b = facts({})
+    if now_gib is not None:
+        b["facts"]["prom.etcd_db_size_now"] = {
+            "value": now_gib * GIB, "source": "t"}
+    if pred_gib is not None:
+        b["facts"]["prom.etcd_db_predict_30d"] = {
+            "value": pred_gib * GIB, "source": "t"}
     b["collected_at"] = ts
     return b
 
@@ -59,14 +60,34 @@ check("no growth, no compaction warning",
                "K8S_ETCD_QUOTA_BEFORE_COMPACTION"))
 
 
-print("\nthe plain 30d forecast line stays, annotated with the compaction date")
+print("\nprojection at the next compaction")
 
-fs = normalize_prom.r_prom_forecasts(bundle(3.0, 15.0))
+# 2 -> 5 GiB in 30d = 0.1 GiB/day; at compaction 2+0.1*7.6 = 2.76 = 69%: quiet
+fs = normalize_prom.r_prom_forecasts(bundle(2.0, 5.0))
+check("safe projection fires NOTHING (no false warn when the month fits)",
+      fs == [], str([f["id"] for f in fs]))
+# 2 -> 7.7 GiB in 30d = 0.19/d; quota in 10.5d > 7.6d, at compaction 86%: warn
+fs = normalize_prom.r_prom_forecasts(bundle(2.0, 7.7))
+h = find(fs, "K8S_ETCD_HIGH_AT_COMPACTION")
+check(">= 85% projected at compaction warns, with the date in the detail",
+      len(h) == 1 and h[0]["severity"] == "warn"
+      and any("2026-11-01" in d for d in h[0]["detail"]),
+      str(h and h[0]["title"]))
+
+
+print("\nthe raw 30d line is a fallback for bundles without size_now")
+
+fs = normalize_prom.r_prom_forecasts(bundle(None, 3.0))
 fc = find(fs, "K8S_ETCD_FORECAST")
-check(">= 60% forecast still fires and names the next compaction",
+check("no size fact: legacy forecast still fires, annotated + framed as raw",
       len(fc) == 1
       and any("2026-11-01" in d and "upper bound" in d
-              for d in fc[0]["detail"]), fc and fc[0]["title"])
+              for d in fc[0]["detail"])
+      and any("current db size unknown" in d for d in fc[0]["detail"]),
+      str(fc and fc[0]["title"]))
+check("size_now known: K8S_ETCD_FORECAST never fires",
+      not find(normalize_prom.r_prom_forecasts(bundle(2.0, 7.7)),
+               "K8S_ETCD_FORECAST"))
 check("size_now alone, no forecast: no compaction math, no crash",
       not find(normalize_prom.r_prom_forecasts(bundle(3.0)),
                "K8S_ETCD_QUOTA_BEFORE_COMPACTION"))

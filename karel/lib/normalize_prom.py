@@ -854,16 +854,25 @@ def r_prom_forecasts(bundle):
     """Quota forecasts. For etcd the naive 30d predict_linear is misleading
     by itself: the database is compacted on the 1st of each month, which
     resets its size. The danger is not 'predicted size in 30 days over the
-    quota' but 'quota reached BEFORE the next compaction'. That is esti-
-    mated from the current size and the regression's growth slope:
-    days_to_quota = (quota - now) / growth_per_day. The 30d figure stays
-    as the regression floor; the compaction-aware math is the threat."""
+    quota' but 'quota reached before the growth gets reset'. With the
+    current size known, the only threats worth a finding are:
+
+      * the quota is reached BEFORE the next compaction
+      * the projected size AT the next compaction is already above the
+        critical watermark - the month after leaves no room
+      * the current size is already at the watermark
+
+    When everything fits before the compaction, the report stays quiet -
+    a 30-day line crossing a reset day is an upper bound, not a schedule,
+    and warning on it is a false alarm. The raw 30d line survives only as
+    a fallback for bundles without the current-size fact."""
     out = []
     quota = 4 * 1024 ** 3   # this cluster sets quota-backend-bytes=4Gi
+    crit_pct = PROM_THRESHOLDS["etcd_quota_crit_pct"]
     now_size = _f(bundle, "prom.etcd_db_size_now")
     if now_size:
         now_pct = 100.0 * now_size / quota
-        if now_pct >= PROM_THRESHOLDS["etcd_quota_crit_pct"]:
+        if now_pct >= crit_pct:
             out.append(_finding(
                 "K8S_ETCD_NEAR_QUOTA", "crit",
                 "etcd database at %s (%.0f%% of the 4GiB quota)"
@@ -905,10 +914,44 @@ def r_prom_forecasts(bundle):
                                  "member at a time",
                                  "then find the churn: Events, Leases, or a "
                                  "controller rewriting status in a loop"]))
-    if etcd:
+            else:
+                at_compact = now_size + growth_day * days_to_compact
+                pct_compact = 100.0 * at_compact / quota
+                if pct_compact >= crit_pct:
+                    out.append(_finding(
+                        "K8S_ETCD_HIGH_AT_COMPACTION", "warn",
+                        "etcd growth (%s/day) reaches %.0f%% of the 4GiB "
+                        "quota by the monthly compaction"
+                        % (_human_bytes(growth_day), pct_compact),
+                        detail=["projected %s on %s (%.0f days away); the "
+                                "compaction then buys at most one more "
+                                "month at the same growth"
+                                % (_human_bytes(at_compact),
+                                   t_compact.strftime("%Y-%m-%d"),
+                                   days_to_compact),
+                                "today: %s (%.0f%%); the quota itself is "
+                                "not reached before the reset"
+                                % (_human_bytes(now_size),
+                                   100.0 * now_size / quota)],
+                        evidence=["prom:etcd_db_size_now",
+                                  "prom:etcd_db_predict_30d"],
+                        metric=round(pct_compact, 1),
+                        remediation=["find the churn before the next cycle: "
+                                     "Events, Leases, or a controller "
+                                     "rewriting status in a loop",
+                                     "a compaction + defrag ahead of schedule "
+                                     "resets the clock, one member at a "
+                                     "time"]))
+    elif etcd:
+        # Fallback for bundles without the current-size fact: the raw 30d
+        # line is all there is, so keep the old thresholds - and say that
+        # a line crossing a monthly compaction overstates the end size.
         pct = 100.0 * etcd / quota
         if pct >= 60:
             detail = ["regression over 14 days",
+                      "current db size unknown - the compaction-aware "
+                      "projection could not be computed, so this is the raw "
+                      "30-day regression line",
                       "hitting the quota puts etcd into a read-only NOSPACE "
                       "alarm"]
             t_compact, days_to_compact = _next_month_compaction(
