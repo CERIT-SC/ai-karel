@@ -7,6 +7,12 @@ allocatable), and the GPU operator's nvidia.com/* labels. The ClusterPolicy
 status and crash-log classification are separate collections
 (k_clusterpolicy, k_log_gpu_crash).
 
+Under DRA the classic device plugin advertises nothing on ANY GPU node -
+nvidia.com/gpu stays 0 by design and allocation runs through ResourceSlices
+(k_resourceslices). r_gpu_health therefore only raises
+K8S_GPU_NOT_ADVERTISED when the fleet has no slices at all; one slice is
+enough to make zero advertisement the expected state.
+
 Threshold: the 25% CRIT line for K8S_GPU_NOT_ADVERTISED lives directly in
 r_gpu_health (single use, documented there).
 """
@@ -148,7 +154,12 @@ def r_gpu_health(bundle):
                 per_res.append("%s=%d/%d" % (rk, alloc, cap))
         if per_res:
             unhealthy.append((n, per_res))
-        elif not cap_total and n not in dra:
+        elif not cap_total and not dra:
+            # Once the GPU stack is switched to DRA, nodes advertise no
+            # nvidia.com/gpu capacity or allocatable AT ALL (the classic
+            # device plugin is disabled; allocation runs through
+            # ResourceSlices). Any slice in the fleet -> missing
+            # advertisement is the expected state, not a dead stack.
             not_advertised.append(n)
 
     if unhealthy:
@@ -169,6 +180,10 @@ def r_gpu_health(bundle):
                          "node; XID errors in dmesg name the GPU"]))
 
     if not_advertised:
+        # Reached only when the fleet has no ResourceSlices at all - a
+        # DRA-managed fleet passes above. So "advertises nothing" here
+        # really means the classic device plugin is supposed to serve
+        # these nodes and is not.
         frac = len(not_advertised) / float(len(gpu_nodes))
         sev = "crit" if frac >= 0.25 else "warn"
         out.append(_finding(
@@ -178,10 +193,7 @@ def r_gpu_health(bundle):
             detail=not_advertised +
                    ["the node is labelled or provisioned for GPU but the "
                     "device plugin advertises nothing - the stack on that "
-                    "node is down, or the driver never loaded"] +
-                   (["(nodes serving GPUs through DRA slices instead: %s)"
-                     % ", ".join(sorted(n for n in gpu_nodes if n in dra))]
-                    if any(n in dra for n in gpu_nodes) else []),
+                    "node is down, or the driver never loaded"],
             evidence=["k_nodes"], metric=float(len(not_advertised)),
             remediation=["without the resource the scheduler sends no GPU "
                          "workload here; the node idles while GPU queues "

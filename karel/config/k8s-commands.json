@@ -55,6 +55,7 @@
 
     { "name": "k_top_cpu",        "argv": ["python3","${KAREL_HOME}/bin/collect_usage.py","cpu"],               "tier": 9, "timeout": 1200 },
     { "name": "k_top_gpu",        "argv": ["python3","${KAREL_HOME}/bin/collect_usage.py","gpu"],               "tier": 9, "timeout": 600 },
+    { "name": "k_jupyter_notebooks", "argv": ["python3","${KAREL_HOME}/bin/collect_jupyter.py"],                "tier": 9, "timeout": 300 },
 
     { "name": "k_top_nodes",      "argv": ["kubectl","top","nodes","--no-headers"],                             "tier": 2, "timeout": 30, "expect_json": false },
     { "name": "k_apiserver_metrics", "argv": ["python3","${KAREL_HOME}/bin/apiserver_metrics.py"],                 "tier": 2, "timeout": 60 },

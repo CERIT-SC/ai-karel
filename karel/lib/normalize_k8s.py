@@ -1601,22 +1601,48 @@ def p_usage(o, F, src):
         rdr = _csv.reader(_io.StringIO(text))
         header = next(rdr, None)
         ns_i, pod_i, req_i, use_i, age_i, model_i = _usage_columns(header or [])
+        gpu_requests = (F.get_value("k8s.pod.gpu_requests", {}) or {}) \
+            if res == "gpu" else {}
         for rec in rdr:
             if len(rec) <= max([i for i in (ns_i, pod_i, req_i) if i is not None]):
                 continue
-            req = _usage_num(rec[req_i]) if req_i is not None else None
+            nn = "%s/%s" % (rec[ns_i].strip(), rec[pod_i].strip())
+            req_raw = rec[req_i].strip() if req_i is not None else ""
+            req = _usage_num(req_raw) if req_i is not None else None
+
+            gpu_mem_only = False
+            if res == "gpu":
+                req_low = req_raw.lower()
+                if "gpu-mem" in req_low and "gpu +" not in req_low:
+                    m = re.match(r"(\d+(?:\.\d+)?)", req_raw)
+                    if m:
+                        req = float(m.group(1))
+                    gpu_mem_only = True
+                breakdown = gpu_requests.get(nn) or {}
+                if not breakdown.get("cards") and not breakdown.get("mig") and \
+                        breakdown.get("gpu_mem_gb"):
+                    gpu_mem_only = True
+                    if req is None:
+                        req = float(breakdown["gpu_mem_gb"])
+
             use = _usage_num(rec[use_i]) if use_i is not None else None
             use_raw = rec[use_i].strip() if use_i is not None else ""
             # GPU usage is a percentage of the REQUESTED cards, not an
             # absolute: "6.0%" of 1 card is 0.06, not 6 - the ratio is the
-            # number that makes waste arithmetic meaningful.
+            # number that makes waste arithmetic meaningful. gpu-mem is a
+            # memory quota, not a card count; keep the displayed fraction for
+            # sorting but exclude it from card-waste arithmetic below.
             if use is not None and "%" in use_raw and req is not None:
-                use = req * use / 100.0
+                if gpu_mem_only:
+                    use = use / 100.0
+                else:
+                    use = req * use / 100.0
             rows.append({
-                "nn": "%s/%s" % (rec[ns_i].strip(), rec[pod_i].strip()),
+                "nn": nn,
                 "req": req,
                 "use": use,
                 "use_raw": use_raw,
+                "gpu_mem": gpu_mem_only,
                 "model": (rec[model_i].strip()
                           if model_i is not None else ""),
                 "age_h": _usage_age_h(rec[age_i]) if age_i is not None else None,
@@ -1633,6 +1659,8 @@ def p_usage(o, F, src):
 
     waste_rows, waste_total = [], 0.0
     for r in ranked:
+        if r.get("gpu_mem"):
+            continue
         if r["req"] is None or r["use"] is None:
             continue
         if r["use"] < r["req"]:
@@ -1653,14 +1681,79 @@ def p_usage(o, F, src):
     F.add(b + ".top", top, src)
     if res == "gpu":
         def key(r):
-            return (0 if r["use"] is None else 1,
+            # Missing series is first, then Scavenger rows. The latter can be
+            # busy while sharing someone else's card, so usage-order alone can
+            # drop them from a 30-row table even though they are allocations
+            # the operator asked to see.
+            priority = 0 if r["use"] is None else (1 if r.get("gpu_mem") else 2)
+            return (priority,
                     r["use"] if r["use"] is not None else 0,
                     -(r["age_h"] or 0))
         gpu_top = sorted(ranked, key=key)[:limit]
         F.add(b + ".top_gpu", [
-            [r["nn"], (r["use_raw"] or "n/a"), r["req"], r.get("model") or "",
+            [r["nn"], (r["use_raw"] or "n/a"),
+             ("%.1f gpu-mem" % r["req"] if r.get("gpu_mem") and
+              r["req"] is not None else r["req"]),
+             r.get("model") or "",
              ("%.0f h" % r["age_h"]) if r["age_h"] is not None else "?"]
             for r in gpu_top], src)
+
+
+def p_jupyter(o, F, src):
+    """collect_jupyter.py document: jupyter-* pods with GPU 24h / CPU 72h.
+
+    Same storage policy as p_usage: per-pod rows survive only where they are
+    the point of the report (GPU holders and CPU-active notebooks), bounded.
+    A mig or gpu-mem pod can never have per-pod GPU metrics on this cluster -
+    that absence is a known blind spot, stored separately from real idle GPUs.
+    """
+    b = "k8s.jupyter"
+    if o.get("error"):
+        F.add(b + ".error", o["error"], src)
+        return
+    pods = o.get("pods") or []
+    counts = o.get("counts") or {}
+    prom = o.get("prom") or {}
+
+    F.add(b + ".count", counts.get("pods", len(pods)), src)
+    F.add(b + ".by_gpu_kind", counts.get("by_gpu_kind") or {}, src)
+    F.add(b + ".prom_reachable", bool(prom.get("reachable")), src)
+    for qname, q in (prom.get("queries") or {}).items():
+        if q.get("status") != "ok":
+            F.add(b + ".prom_errors.%s" % qname, q.get("error"), src)
+    if prom.get("error"):
+        F.add(b + ".prom_error", prom["error"], src)
+
+    def _age(p):
+        return ("%.0f h" % p["age_h"]) if p.get("age_h") is not None else "?"
+
+    gpu_rows, blind_rows, idle = [], [], []
+    for p in pods:
+        kind = p.get("gpu_kind")
+        if kind == "full":
+            row = [p["nn"], p.get("gpu_request") or "",
+                   ("%.1f%%" % p["gpu_avg_24h_pct"]
+                    if p.get("gpu_avg_24h_pct") is not None else "n/a"),
+                   ("%.1f%%" % p["gpu_max_24h_pct"]
+                    if p.get("gpu_max_24h_pct") is not None else "n/a"),
+                   p.get("gpu_verdict") or "?", _age(p)]
+            gpu_rows.append(row)
+            if p.get("gpu_verdict", "").startswith("idle"):
+                idle.append(p["nn"])
+        elif kind in ("mig", "gpu-mem"):
+            blind_rows.append([p["nn"], p.get("gpu_request") or "",
+                               kind, _age(p)])
+    F.add(b + ".gpu_pods", gpu_rows, src)
+    F.add(b + ".gpu_blind", blind_rows, src)
+    F.add(b + ".gpu_idle", sorted(idle), src)
+
+    active = sorted((p for p in pods if p.get("cpu_active_72h")),
+                    key=lambda p: -(p.get("cpu_max_72h_cores") or 0))
+    F.add(b + ".cpu_active_count", len(active), src)
+    F.add(b + ".cpu_active", [
+        [p["nn"], p["cpu_max_72h_cores"], p.get("cpu_avg_72h_cores"),
+         p.get("cpu_max_24h_cores"), p.get("gpu_kind") or "none", _age(p)]
+        for p in active[:40]], src)
 
 
 def p_storageclass(o, F, src):
@@ -2135,6 +2228,7 @@ PARSERS = {
     "k_cnpg_clusters": p_cnpg_clusters,
     "k_top_cpu": p_usage,
     "k_top_gpu": p_usage,
+    "k_jupyter_notebooks": p_jupyter,
     "k_log_thanos_sidecar": p_log_check,
     "k_log_thanos_compactor": p_log_check,
     "k_log_thanos_querier": p_log_check,

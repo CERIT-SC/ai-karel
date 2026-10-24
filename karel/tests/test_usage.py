@@ -199,4 +199,41 @@ check("the table annotates the unit instead of saying '60 GPUs'",
       row[2] == "60.0 gpu-mem" and "gpu-mem" in (_t.get("note") or ""), row)
 
 
+# --------------------------------------------------------------------------
+print("\nnew GPU binary Scavenger output survives normalization")
+
+CSV_GPU_SCAVENGER = (
+    "namespace,pod,prometheus_usage,k8s_requests,age,model_name\n"
+    "vo,jupyter-perrine,82.9%,60 gpu-mem,2d0h0m,"
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition-Scavenger\n"
+    "vo,card-job,0.0%,1,2d0h0m,NVIDIA A40\n"
+)
+F = normalize.Facts()
+normalize_k8s.p_usage({"resource": "gpu", "csv": CSV_GPU_SCAVENGER, "rows": 2},
+                      F, "k_top_gpu")
+check("gpu-mem CSV value is still a row, not a parse failure",
+      F.get_value("k8s.usage.gpu.total_pods") == 2 and
+      F.get_value("k8s.usage.gpu.parse_error") is None,
+      F.get_value("k8s.usage.gpu.parse_error"))
+check("gpu-mem does not inflate whole-card waste arithmetic",
+      F.get_value("k8s.usage.gpu.waste_total") == 1.0,
+      F.get_value("k8s.usage.gpu.waste_total"))
+topg = F.get_value("k8s.usage.gpu.top_gpu")
+check("Scavenger row keeps request, usage, model and age",
+      topg and topg[0] == [
+          "vo/jupyter-perrine", "82.9%", "60.0 gpu-mem",
+          "NVIDIA RTX PRO 6000 Blackwell Server Edition-Scavenger",
+          "48 h"], topg)
+
+pairs = {k: v["value"] for k, v in F.items()}
+pairs["k8s.pod.gpu_requests"] = {
+    "vo/jupyter-perrine": {"cards": 0, "mig": 0, "gpu_mem_gb": 60}}
+fs = rules_k8s.r_resource_waste(facts(pairs))
+_t = fs[0].get("table") or fs[0]["tables"][0]
+check("the report does not double-annotate or drop Scavenger rows",
+      any(r[0] == "vo/jupyter-perrine" and r[2] == "60.0 gpu-mem" and
+          "Scavenger" in r[3] for r in _t["rows"]) and
+      any("card-job" in r[0] for r in _t["rows"]), _t)
+
+
 finish()

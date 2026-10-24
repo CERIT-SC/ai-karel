@@ -13,7 +13,8 @@ TESTS = os.path.join(ROOT, "tests")
 FILES = ["test_regressions.py", "test_logs.py", "test_events.py",
          "test_gpu.py", "test_housekeeping.py", "test_failed_recent.py",
          "test_run_sh.py", "test_acme.py", "test_usage.py", "test_gateway.py",
-         "test_cnpg.py", "test_ai_contract.py", "test_snapshots.py", "test_prom_pvc.py", "fuzz.py", "consistency.py"]
+         "test_cnpg.py", "test_ai_contract.py", "test_snapshots.py", "test_prom_pvc.py",
+         "test_etcd_forecast.py", "fuzz.py", "consistency.py"]
 
 
 def main():

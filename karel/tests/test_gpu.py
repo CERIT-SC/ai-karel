@@ -284,6 +284,42 @@ check("the DRA-only node is not called dark",
 
 
 # --------------------------------------------------------------------------
+print("\nDRA switch: zero nvidia.com/gpu fleet-wide is expected, not an error")
+
+F = normalize.Facts()
+normalize_k8s.p_nodes({"items": [
+    # After the DRA switch the classic device plugin advertises 0/0 on
+    # EVERY GPU node; gpu-mem shares keep their own quota resource.
+    node_obj("kub-a18", {"nvidia.com/gpu": "0"}, {"nvidia.com/gpu": "0"},
+             GPU_L),
+    node_obj("kub-b10", {"nvidia.com/gpu": "0", "nvidia.com/gpu-mem": "71"},
+             {"nvidia.com/gpu": "0", "nvidia.com/gpu-mem": "70"}, GPU_L),
+    node_obj("kub-a12", {"nvidia.com/gpu": "0"}, {"nvidia.com/gpu": "0"},
+             GPU_L),
+]}, F, "k_nodes")
+normalize_k8s.p_resourceslices({"items": [
+    {"metadata": {"name": "a12-slice-1"},
+     "spec": {"nodeName": "kub-a12", "driver": "gpu.nvidia.com",
+              "devices": [{"name": "gpu-0"}, {"name": "gpu-1"}]}},
+]}, F, "k_resourceslices")
+fs = _rg.r_gpu_health(facts({k: v["value"] for k, v in F.items()}))
+check("DRA fleet with zero classic capacity raises NO not-advertised error",
+      not any(f["id"] == "K8S_GPU_NOT_ADVERTISED" for f in fs), fs)
+
+# ...but a fleet with no slices ANYWHERE still flags its dark nodes.
+F = normalize.Facts()
+normalize_k8s.p_nodes({"items": [
+    node_obj("gpu-01", {"nvidia.com/gpu": "0"}, {"nvidia.com/gpu": "0"},
+             GPU_L),
+    node_obj("gpu-02", {"nvidia.com/gpu": "0"}, {"nvidia.com/gpu": "0"},
+             GPU_L),
+]}, F, "k_nodes")
+fs = _rg.r_gpu_health(facts({k: v["value"] for k, v in F.items()}))
+check("no-DRA fleet with zero capacity still raises K8S_GPU_NOT_ADVERTISED",
+      any(f["id"] == "K8S_GPU_NOT_ADVERTISED" for f in fs), fs)
+
+
+# --------------------------------------------------------------------------
 print("\nGFD crashloop + strategy line -> restart the toolkit pod ON that node")
 
 

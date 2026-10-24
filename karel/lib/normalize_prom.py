@@ -157,6 +157,9 @@ PROM_THRESHOLDS = {
     "etcd_fsync_p99_warn": 0.05,
     "etcd_leader_changes_warn": 3,
     "pvc_used_warn": 85.0,
+    "pvc_nfs_warn": 95.0,
+    "pvc_nfs_crit": 97.0,
+    "etcd_quota_crit_pct": 85.0,
     "min_retention_days_for_trend": 7.0,
 }
 
@@ -788,30 +791,39 @@ def r_prom_peaks(bundle):
                              "for the failover case"]))
 
     pvcs = _f(bundle, "prom.pvc_used_pct_max", []) or []
-    full = [p for p in pvcs if (p.get("value") or 0) >= PROM_THRESHOLDS["pvc_used_warn"]]
 
     # nfs-csi* classes are subdirectories of ONE shared volume: every PVC
     # reports (approximately) the VOLUME's fullness, so N rows are one
     # cause - "the storage became full" - not N problems. Collapse them.
+    # The shared volume also gets a higher, two-step alarm: filing at 85%
+    # meant permanent noise on a multi-TB backend; 95% warns, 97% is
+    # critical. Local classes keep the plain 85% warn.
+    warn = PROM_THRESHOLDS["pvc_used_warn"]
+    nfs_warn = PROM_THRESHOLDS["pvc_nfs_warn"]
+    nfs_crit = PROM_THRESHOLDS["pvc_nfs_crit"]
     sc_map = _f(bundle, "k8s.pvc.storageclass_map", {}) or {}
     nfs_classes = [s for s in (_f(bundle, "k8s.storageclass.names", []) or [])
                    if str(s).startswith("nfs-csi")]
     shared, singles = [], []
-    for p in full:
+    for p in pvcs:
         nn = "%s/%s" % (p["labels"].get("namespace"),
                         p["labels"].get("persistentvolumeclaim"))
         cls = sc_map.get(nn)
+        v = p.get("value") or 0
         if cls and cls in nfs_classes:
-            shared.append((nn, p.get("value") or 0, cls))
-        else:
+            if v >= nfs_warn:
+                shared.append((nn, v, cls))
+        elif v >= warn:
             singles.append(p)
     if shared:
         vals = [v for _nn, v, _c in shared]
+        crit = max(vals) >= nfs_crit
         out.append(_finding(
-            "K8S_PVC_NEARFULL", "warn",
+            "K8S_PVC_NEARFULL", "crit" if crit else "warn",
             "shared nfs-csi volume at ~%.0f%% (%d PVC(s) report the same "
-            "volume over %.0f%%)"
-            % (max(vals), len(shared), PROM_THRESHOLDS["pvc_used_warn"]),
+            "volume over %.0f%%%s)"
+            % (max(vals), len(shared), nfs_warn,
+               " - above the %.0f%% critical mark" % nfs_crit if crit else ""),
             subject="nfs-csi-shared",
             detail=["%s: %.0f%% (%s)" % (nn, v, cls) for nn, v, cls
                     in sorted(shared, key=lambda x: -x[1])[:8]] +
@@ -839,25 +851,100 @@ def r_prom_peaks(bundle):
 
 
 def r_prom_forecasts(bundle):
-    """predict_linear over 14 days, replacing the two-point extrapolation."""
+    """Quota forecasts. For etcd the naive 30d predict_linear is misleading
+    by itself: the database is compacted on the 1st of each month, which
+    resets its size. The danger is not 'predicted size in 30 days over the
+    quota' but 'quota reached BEFORE the next compaction'. That is esti-
+    mated from the current size and the regression's growth slope:
+    days_to_quota = (quota - now) / growth_per_day. The 30d figure stays
+    as the regression floor; the compaction-aware math is the threat."""
     out = []
+    quota = 4 * 1024 ** 3   # this cluster sets quota-backend-bytes=4Gi
+    now_size = _f(bundle, "prom.etcd_db_size_now")
+    if now_size:
+        now_pct = 100.0 * now_size / quota
+        if now_pct >= PROM_THRESHOLDS["etcd_quota_crit_pct"]:
+            out.append(_finding(
+                "K8S_ETCD_NEAR_QUOTA", "crit",
+                "etcd database at %s (%.0f%% of the 4GiB quota)"
+                % (_human_bytes(now_size), now_pct),
+                detail=["hitting the quota puts etcd into a read-only NOSPACE "
+                        "alarm - every write fails until a defrag reclaims "
+                        "space",
+                        "monthly compaction is days away; that is too long "
+                        "to wait at this level"],
+                evidence=["prom:etcd_db_size_now"], metric=now_pct,
+                remediation=["compact + defrag the members NOW, one at a "
+                             "time (defrag blocks the member briefly)"]))
     etcd = _f(bundle, "prom.etcd_db_predict_30d")
+    if etcd and now_size:
+        growth_day = (etcd - now_size) / 30.0
+        if growth_day > 0:
+            t_compact, days_to_compact = _next_month_compaction(
+                bundle.get("collected_at"))
+            days_to_quota = (quota - now_size) / growth_day
+            if days_to_quota < days_to_compact:
+                out.append(_finding(
+                    "K8S_ETCD_QUOTA_BEFORE_COMPACTION", "warn",
+                    "etcd growth (%s/day) reaches the 4GiB quota in ~%.0f "
+                    "days, before the monthly compaction"
+                    % (_human_bytes(growth_day), days_to_quota),
+                    detail=["regression over 14 days: %s now, %s predicted "
+                            "in 30 days"
+                            % (_human_bytes(now_size), _human_bytes(etcd)),
+                            "monthly compaction is on %s, %.0f days away - "
+                            "it would not come soon enough"
+                            % (t_compact.strftime("%Y-%m-%d"),
+                               days_to_compact),
+                            "hitting the quota puts etcd into a read-only "
+                            "NOSPACE alarm"],
+                    evidence=["prom:etcd_db_size_now",
+                              "prom:etcd_db_predict_30d"],
+                    metric=round(days_to_compact - days_to_quota, 1),
+                    remediation=["compact + defrag ahead of schedule, one "
+                                 "member at a time",
+                                 "then find the churn: Events, Leases, or a "
+                                 "controller rewriting status in a loop"]))
     if etcd:
-        quota = 4 * 1024 ** 3   # this cluster sets quota-backend-bytes=4Gi
         pct = 100.0 * etcd / quota
         if pct >= 60:
+            detail = ["regression over 14 days",
+                      "hitting the quota puts etcd into a read-only NOSPACE "
+                      "alarm"]
+            t_compact, days_to_compact = _next_month_compaction(
+                bundle.get("collected_at"))
+            detail.append(
+                "the database is compacted on the 1st of each month (next: "
+                "%s, %.0f days); a 30-day line crossing that day overstates "
+                "the end size - it is an upper bound, not a schedule"
+                % (t_compact.strftime("%Y-%m-%d"), days_to_compact))
             out.append(_finding(
                 "K8S_ETCD_FORECAST", "warn" if pct < 90 else "crit",
                 "etcd database trending to %s (%.0f%% of the 4GiB quota) in 30 days"
                 % (_human_bytes(etcd), pct),
-                detail=["regression over 14 days",
-                        "hitting the quota puts etcd into a read-only NOSPACE alarm"],
+                detail=detail,
                 evidence=["prom:etcd_db_predict_30d"], metric=pct,
                 remediation=["find the churn: Events, Leases, or a controller "
                              "rewriting status in a loop",
                              "compaction and defrag reclaim space; defrag blocks "
                              "the member briefly, so do one at a time"]))
     return out
+
+
+def _next_month_compaction(collected_at):
+    """(datetime, days) of the next 1st-of-month compaction after collected_at.
+    Falls back to wall-clock now when the bundle carries no timestamp."""
+    try:
+        now = _datetime.datetime.strptime(
+            collected_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_datetime.timezone.utc)
+    except (TypeError, ValueError):
+        now = _datetime.datetime.now(_datetime.timezone.utc)
+    year, month = (now.year, now.month + 1) if now.month < 12 \
+        else (now.year + 1, 1)
+    t = _datetime.datetime(year, month, 1, tzinfo=_datetime.timezone.utc)
+    return t, (t - now).total_seconds() / 86400.0
+
 
 
 RULES = [

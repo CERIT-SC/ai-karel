@@ -23,6 +23,7 @@ of things that actually need a human today — and make it impossible to mistake
 │   ├── collect_logs.py        run one log check; aggregate in the collector
 │   ├── collect_events.py      one filtered, bounded events pass (daily k_events)
 │   ├── collect_usage.py       k8s-pod-resource-usage wrapper (CPU/GPU waste)
+│   ├── collect_jupyter.py     jupyter-* pods: GPU over 24h, CPU over 72h
 │   ├── event_buffer.py        CronJob: accumulate filtered events per day
 │   ├── fetch_event_buffer.py  read today's + yesterday's event buffers
 │   ├── prom_query.py          Prometheus/Alertmanager collector
@@ -71,6 +72,8 @@ of things that actually need a human today — and make it impossible to mistake
 | `KAREL_DEMO_IMAGES` | `paulbouwer/hello-kubernetes` | comma-separated demo images for `demo_workload` |
 | `KAREL_USAGE_BIN` | `k8s-pod-resource-usage` | binary for the usage pass |
 | `KAREL_USAGE_TIMEOUT_CPU/GPU` | `1200`/`600` | per-resource timeouts for the usage pass |
+| `KAREL_JUPYTER_CPU_PEAK_CORES` | `0.5` | 72h CPU peak (cores) that marks a notebook as still in use |
+| `KAREL_JUPYTER_GPU_IDLE_MAX_PCT` | `10` | whole-GPU notebook whose 24h max stays below this is reported idle |
 | `SUPPRESSIONS_FILE` | `/tmp/suppressions.json` | ledger file the usage wrapper reads for `usage_exclude` |
 | `PROM_ENABLED` | `1` | set `0` to skip Prometheus entirely |
 | `PROM_URL` | rancher-monitoring service | Prometheus base URL |
@@ -375,9 +378,12 @@ allocatable below capacity for unhealthy GPUs (`K8S_GPU_UNHEALTHY`), and the
 operator's `nvidia.com/*` labels identify GPU nodes before any resource is
 advertised (`K8S_GPU_NOT_ADVERTISED`; CRIT once a quarter of GPU nodes are
 dark). Both checks treat **full GPUs and MIG slices** (`nvidia.com/mig-*`)
-as one health model — a 7-of-6 MIG slice is named explicitly — and a node
-serving GPUs **only through DRA** is detected via its ResourceSlices
-(`k_resourceslices`) rather than wrongly called dark. The GPU operator's
+as one health model — a 7-of-6 MIG slice is named explicitly — and a
+**DRA-managed** fleet, where nodes advertise no `nvidia.com/gpu` capacity or
+allocatable at all by design, is detected via its ResourceSlices
+(`k_resourceslices`): one slice anywhere makes zero advertisement the
+expected state and silences `K8S_GPU_NOT_ADVERTISED`; with no slices at all,
+a dark node is once again a broken stack. The GPU operator's
 pods are tracked per node, so a node with a broken stack is one
 `K8S_GPU_STACK_DEGRADED` finding — the matching pod-backoff and
 DaemonSet entries are folded into it (a crashlog line like `Driver/library
@@ -493,10 +499,13 @@ does not fit the main budget. Output: top-20 CPU and top-30 GPU tables as
 tenants, never per-pod findings.
 
 One unit trap worth knowing: JupyterHub's gpushare pods request
-`nvidia.com/gpu-mem` (GiB of shared GPU *memory*), not whole cards, and the
-binary sums that limit into the card column. Karel restores the unit from
-the pod spec (`k8s.pod.gpu_requests` breakdown of cards/MIG/gpu-mem GiB) —
-a table cell reads `60.0 gpu-mem`, never "60 GPUs".
+`nvidia.com/gpu-mem` (GiB of shared GPU *memory*), not whole cards. The usage
+binary marks those rows `NN gpu-mem` and the model as `...-Scavenger`; Karel
+keeps that separate from whole-card waste arithmetic. It also recognises the
+older numeric-only form through the pod-spec breakdown, so a table cell reads
+`60.0 gpu-mem`, never "60 GPUs". Scavenger rows rank ahead of ordinary
+ascending-usage rows so the 30-row cutoff cannot silently hide a shared-GPU
+allocation.
 
 ## Gateway API
 

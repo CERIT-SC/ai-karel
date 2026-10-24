@@ -1381,26 +1381,127 @@ def r_resource_waste(bundle):
         mem_annotated = 0
         for nn, u, r, m, a in rows_gpu:
             br = gpu_reqs.get(nn) or {}
-            if not br.get("cards") and not br.get("mig") and \
-                    br.get("gpu_mem_gb"):
-                # gpu-mem is the JupyterHub shared-memory quota (GiB),
-                # silently summed into the card column by the binary.
-                r = "%s gpu-mem" % r
+            gpu_mem = (not br.get("cards") and not br.get("mig") and
+                       br.get("gpu_mem_gb")) or "gpu-mem" in str(r).lower()
+            if gpu_mem:
+                # New usage binaries already carry the unit; older ones only
+                # carried the numeric quota. Render either form exactly once.
+                if "gpu-mem" not in str(r).lower():
+                    r = "%s gpu-mem" % r
                 mem_annotated += 1
             gpu_table_rows.append([nn, u, r, m or _model(nn), a])
         tables.append({
-            "title": "top 30 GPU rows (no-series first)",
+            "title": "top 30 GPU rows (no-series and Scavenger first)",
             "headers": ["pod", "usage", "request", "model", "age"],
             "align": ["l", "r", "r", "l", "r"],
             "rows": gpu_table_rows,
             "note": ("request marked 'gpu-mem' is JupyterHub shared-memory "
-                     "quota (GiB), not whole GPUs; the binary cannot split "
-                     "them out, Karel restores the unit." if mem_annotated
-                     else None),
+                     "quota (GiB), not a whole-GPU allocation."
+                     if mem_annotated else None),
         })
     if len(tables) == 1:
         f["table"] = tables[0]
     else:
+        f["tables"] = tables
+    out.append(f)
+    return out
+
+
+def r_jupyter_notebooks(bundle):
+    """jupyter-* pods: is the notebook alive, and does its GPU do anything?
+
+    GPU numbers exist only for whole-card pods (nvidia.com/gpu). MIG slices
+    and gpu-mem quotas have no per-pod DCGM series on this cluster, so those
+    pods are listed under a blind spot - never reported as "GPU idle". CPU is
+    measured over 72h for every pod: a peak far above the trailing average is
+    a notebook someone is still running code in."""
+    out = []
+    err = _f(bundle, "k8s.jupyter.error")
+    if err:
+        return [_finding(
+            "K8S_JUPYTER_NOT_COLLECTED", "info",
+            "Jupyter notebook usage not available this run",
+            subject="jupyter",
+            detail=[err,
+                    "no notebook section - a coverage gap, not proof every "
+                    "notebook is fine"],
+            evidence=["k_jupyter_notebooks"])]
+    count = _f(bundle, "k8s.jupyter.count")
+    if count is None:
+        return out
+
+    kinds = _f(bundle, "k8s.jupyter.by_gpu_kind", {}) or {}
+    headline = ["%d notebook pods" % count]
+    for kind in ("full", "mig", "gpu-mem"):
+        if kinds.get(kind):
+            headline.append("%d with %s" % (kinds[kind],
+                            "whole GPU" if kind == "full" else kind))
+    prom_errs = _f(bundle, "k8s.jupyter.prom_error")
+    if not prom_errs and not _f(bundle, "k8s.jupyter.prom_reachable", True):
+        prom_errs = "Prometheus unreachable"
+    detail = [", ".join(headline)]
+    if prom_errs:
+        detail.append("GPU/CPU history unavailable: %s" % prom_errs)
+    idle = _f(bundle, "k8s.jupyter.gpu_idle", []) or []
+    if idle:
+        detail.append("%d whole-GPU notebook(s) idle over 24h: %s"
+                      % (len(idle), ", ".join(idle)))
+    blind = _f(bundle, "k8s.jupyter.gpu_blind", []) or []
+    if blind:
+        detail.append(
+            "%d notebook(s) with MIG/gpu-mem requests can have no per-pod "
+            "GPU metrics (dcgm-exporter exports no MIG or gpu-mem "
+            "attribution) - their GPU use is invisible by design" % len(blind))
+
+    sev = "warn" if idle else "info"
+    if idle:
+        out.append(_finding(
+            "K8S_JUPYTER_GPU_IDLE", sev,
+            "%d whole-GPU Jupyter notebook(s) idle over the last 24h"
+            % len(idle),
+            subject="jupyter",
+            detail=["max GPU utilisation stayed under the idle threshold "
+                    "for a full day - the card is allocated and unused"] +
+                   idle,
+            evidence=["k_jupyter_notebooks"],
+            metric=float(len(idle))))
+    f = _finding(
+        "K8S_JUPYTER_NOTEBOOKS", "info",
+        "Jupyter notebooks: GPU over 24h, CPU over 72h",
+        detail=detail, evidence=["k_jupyter_notebooks"])
+    f["section"] = "Jupyter notebooks"
+    f["section_order"] = 26
+
+    tables = []
+    gpu_pods = _f(bundle, "k8s.jupyter.gpu_pods", []) or []
+    if gpu_pods:
+        tables.append({
+            "title": "notebooks holding a whole GPU (DCGM, last 24h)",
+            "headers": ["pod", "request", "avg 24h", "max 24h", "verdict",
+                        "age"],
+            "align": ["l", "r", "r", "r", "l", "r"],
+            "rows": gpu_pods})
+    if blind:
+        tables.append({
+            "title": "notebooks with GPU via MIG/gpu-mem (no per-pod GPU "
+                     "metrics possible)",
+            "headers": ["pod", "request", "kind", "age"],
+            "align": ["l", "r", "l", "r"],
+            "rows": blind})
+    cpu_active = _f(bundle, "k8s.jupyter.cpu_active", []) or []
+    if cpu_active:
+        tables.append({
+            "title": "notebooks with a CPU peak in the last 72h (still in "
+                     "use)",
+            "headers": ["pod", "max 72h cores", "avg 72h cores",
+                        "max 24h cores", "gpu", "age"],
+            "align": ["l", "r", "r", "r", "l", "r"],
+            "rows": cpu_active,
+            "note": ("peak = max 15-min rate; a notebook above the threshold "
+                     "ran code recently even when its GPU row is empty")})
+    if len(tables) == 1:
+        f["table"] = tables[0]
+    elif tables:
         f["tables"] = tables
     out.append(f)
     return out
@@ -1683,6 +1784,7 @@ RULES = [
     r_tenant_event_patterns,
     r_acme,
     r_resource_waste,
+    r_jupyter_notebooks,
     r_gateway,
     r_cnpg,
     r_failure_patterns,

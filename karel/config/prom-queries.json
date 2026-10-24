@@ -140,6 +140,16 @@
       "source_job": "etcd"
     },
     {
+      "name": "etcd_db_size_now",
+      "expr": "max(etcd_mvcc_db_total_size_in_bytes)",
+      "reduce": "scalar",
+      "tier": 2,
+      "timeout": 30,
+      "_why": "current db size: base of the compaction-aware quota math - the 30d prediction alone cannot say whether the quota is hit BEFORE the monthly compaction",
+      "empty_means": "absent",
+      "source_job": "etcd"
+    },
+    {
       "name": "etcd_leader_changes_24h",
       "expr": "sum(increase(etcd_server_leader_changes_seen_total[24h]))",
       "reduce": "scalar",
